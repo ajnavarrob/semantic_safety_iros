@@ -1,0 +1,4151 @@
+#include <memory>
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <chrono>
+#include <mutex>
+#include <thread>
+#include <random>
+#include <cmath>
+#include <queue>
+#include <map>
+#include <array>
+#include <unistd.h>
+#include <cstring>
+#include <cfloat>
+#include <set>
+#include <shared_mutex>
+
+#include <cuda_runtime.h>
+#include "kernel.hpp"
+#include "poisson.h"
+#include "utils.h"
+#include "mpc_cbf_3d.h"
+#include "cloud_merger.h"
+#include "poisson/human_tracker.h"
+#include "constraints/constraint_manager.hpp"
+
+#include <opencv2/opencv.hpp>
+
+#include <cstdint>
+#include <unordered_set>
+
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/image.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+#include "sensor_msgs/point_cloud2_iterator.hpp"
+#include "nav_msgs/msg/occupancy_grid.hpp"
+#include "geometry_msgs/msg/twist.hpp"
+#include "std_msgs/msg/int32.hpp"
+#include "std_msgs/msg/float32_multi_array.hpp"
+#include "nav_msgs/msg/odometry.hpp"
+#include "unitree_api/msg/request.hpp"
+#include "common/ros2_sport_client.h"
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
+
+namespace ss {
+
+enum class SemanticClass : std::uint16_t
+{
+    Unknown = 0,
+    Person,
+    Chair,
+    Table,
+    Sofa,
+    Door,
+    Cabinet,
+    Plant,
+    Shelf,
+    Desk,
+    Refrigerator,
+    Stairs,
+    Computer,
+    Television,
+    Screen
+};
+
+
+static const char* semantic_class_name(
+    SemanticClass semantic_class)
+{
+    switch (semantic_class) {
+        case SemanticClass::Person:
+            return "person";
+        case SemanticClass::Chair:
+            return "chair";
+        case SemanticClass::Table:
+            return "table";
+        case SemanticClass::Sofa:
+            return "sofa";
+        case SemanticClass::Door:
+            return "door";
+        case SemanticClass::Cabinet:
+            return "cabinet";
+        case SemanticClass::Plant:
+            return "plant";
+        case SemanticClass::Shelf:
+            return "shelf";
+        case SemanticClass::Desk:
+            return "desk";
+        case SemanticClass::Refrigerator:
+            return "refrigerator";
+        case SemanticClass::Stairs:
+            return "stairs";
+        case SemanticClass::Computer:
+            return "computer";
+        case SemanticClass::Television:
+            return "television";
+        case SemanticClass::Screen:
+            return "screen";
+        default:
+            return "unknown";
+    }
+}
+
+static SemanticClass topformer_class_to_semantic_class(
+    std::uint16_t model_class_id)
+{
+    // TopFormer ADE20K class IDs after class_id_offset = 1.
+    switch (model_class_id) {
+        case 11:
+            return SemanticClass::Cabinet;
+        case 13:
+            return SemanticClass::Person;
+        case 15:
+            return SemanticClass::Door;
+        case 16:
+            return SemanticClass::Table;
+        case 18:
+            return SemanticClass::Plant;
+        case 20:
+            return SemanticClass::Chair;
+        case 24:
+            return SemanticClass::Sofa;
+        case 25:
+            return SemanticClass::Shelf;
+        case 34:
+            return SemanticClass::Desk;
+        case 51:
+            return SemanticClass::Refrigerator;
+        case 54:
+            return SemanticClass::Stairs;
+        case 76:
+            return SemanticClass::Computer;
+        case 90:
+            return SemanticClass::Television;
+        case 131:
+            return SemanticClass::Screen;
+        default:
+            return SemanticClass::Unknown;
+    }
+}
+
+static SemanticClass semantic_class_from_name(
+    std::string name)
+{
+    std::transform(
+        name.begin(),
+        name.end(),
+        name.begin(),
+        [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+
+    if (name == "person" ||
+        name == "human" ||
+        name == "people")
+    {
+        return SemanticClass::Person;
+    }
+    if (name == "chair") {
+        return SemanticClass::Chair;
+    }
+    if (name == "table" ||
+        name == "diningtable" ||
+        name == "dining_table")
+    {
+        return SemanticClass::Table;
+    }
+    if (name == "sofa" ||
+        name == "couch")
+    {
+        return SemanticClass::Sofa;
+    }
+    if (name == "door" ||
+        name == "doorway")
+    {
+        return SemanticClass::Door;
+    }
+    if (name == "cabinet") {
+        return SemanticClass::Cabinet;
+    }
+    if (name == "plant" ||
+        name == "pottedplant" ||
+        name == "potted_plant")
+    {
+        return SemanticClass::Plant;
+    }
+    if (name == "shelf" ||
+        name == "bookshelf")
+    {
+        return SemanticClass::Shelf;
+    }
+    if (name == "desk") {
+        return SemanticClass::Desk;
+    }
+    if (name == "refrigerator" ||
+        name == "fridge")
+    {
+        return SemanticClass::Refrigerator;
+    }
+    if (name == "stairs" ||
+        name == "staircase")
+    {
+        return SemanticClass::Stairs;
+    }
+    if (name == "computer") {
+        return SemanticClass::Computer;
+    }
+    if (name == "television" ||
+        name == "tv")
+    {
+        return SemanticClass::Television;
+    }
+    if (name == "screen" ||
+        name == "monitor")
+    {
+        return SemanticClass::Screen;
+    }
+    return SemanticClass::Unknown;
+}
+
+static constexpr std::size_t NUM_CANONICAL_SEMANTIC_CLASSES =
+    static_cast<std::size_t>(SemanticClass::Screen) + 1U;
+
+
+static std::size_t semantic_class_index(
+    SemanticClass semantic_class)
+{
+    return static_cast<std::size_t>(semantic_class);
+}
+
+enum class PipelineStage {
+    OccupancyPreprocess,
+    SemanticFusion,
+    GeometryShaping,
+    GuidanceField,
+    SafetyFieldSolve,
+    DhdtUpdate,
+    PredictiveControl,
+    RealtimeFilter,
+    CommandDispatch
+};
+
+struct TimingSample {
+    double occupancy_preprocess_ms{0.0};
+    double semantic_fusion_ms{0.0};
+    double geometry_shaping_ms{0.0};
+
+    double guidance_boundary_setup_ms{0.0};
+    double guidance_social_expansion_ms{0.0};
+    double guidance_laplace_ms{0.0};
+    double guidance_copyout_ms{0.0};
+
+    double safety_field_solve_ms{0.0};
+    double dhdt_update_ms{0.0};
+    double predictive_control_ms{0.0};
+    double realtime_filter_ms{0.0};
+    double command_dispatch_ms{0.0};
+    double field_data_age_ms{0.0};
+    double end_to_end_grid_ms{0.0};
+};
+
+struct ConnectedComponentsData {
+    cv::Mat binary;
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    int num_labels{0};
+};
+
+struct SemanticStageOutput {
+    bool tight_area{false};
+    std::vector<HumanTrack> active_tracks;
+};
+
+struct GuidanceStageOutput {
+    float* bound_guidance{nullptr};
+};
+
+struct FieldBuffer {
+    std::vector<float> hgrid;
+    std::vector<float> dhdt;
+    std::vector<float> beta;
+    std::vector<float> guidance_x;
+    std::vector<float> guidance_y;
+    std::vector<float> bound;
+
+    std::chrono::steady_clock::time_point timestamp;
+    bool valid{false};
+};
+
+enum class SemanticUpdateMode {
+    NORMAL = 0,
+    INSERTING_CONSTRAINT = 1,
+    REMOVING_CONSTRAINT = 2
+};
+
+struct SemanticUpdateState {
+    SemanticUpdateMode mode{SemanticUpdateMode::NORMAL};
+
+    bool active{false};
+
+    float lambda{1.0f};
+    float lambda_dot{0.0f};
+
+    float lambda_dot_min{0.05f};
+    float lambda_dot_max{0.5f};
+    float max_update_time_sec{20.0f};
+
+    // Temporary until MPC controls semantic update speed.
+    float commanded_lambda_dot{0.5f};
+
+    std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point last_update_time;
+};
+
+class ScopedTimer {
+public:
+    explicit ScopedTimer(double& target_ms)
+        : target_ms_(target_ms), t0_(std::chrono::steady_clock::now()) {}
+
+    ~ScopedTimer() {
+        const auto t1 = std::chrono::steady_clock::now();
+        target_ms_ = std::chrono::duration<double, std::milli>(t1 - t0_).count();
+    }
+
+private:
+    double& target_ms_;
+    std::chrono::steady_clock::time_point t0_;
+};
+
+class PoissonControllerNode : public rclcpp::Node {
+public:
+    PoissonControllerNode() : Node("semantic_poisson"), sport_req(this) {
+        declare_and_load_parameters();
+
+        load_constraints_once_at_startup();
+    
+        initialize_clocks_and_flags();
+        initialize_static_grids();
+        allocate_persistent_buffers();
+        initialize_robot_kernels();
+        initialize_mpc();
+        initialize_ros_interfaces();
+        startup_robot();
+
+        initialize_constraint_reload_timer();
+    }
+
+    ~PoissonControllerNode() override {
+        if (hgrid1) cudaFreeHost(hgrid1);
+        if (hgrid0) cudaFreeHost(hgrid0);
+        if (bound) cudaFreeHost(bound);
+        if (force) cudaFreeHost(force);
+
+        if (dhdt_grid) std::free(dhdt_grid);
+        if (guidance_x_grid) std::free(guidance_x_grid);
+        if (guidance_y_grid) std::free(guidance_y_grid);
+
+        if (hgrid_temp_) std::free(hgrid_temp_);
+        if (guidance_x_temp_) std::free(guidance_x_temp_);
+        if (guidance_y_temp_) std::free(guidance_y_temp_);
+        if (forcing_zero_temp_) std::free(forcing_zero_temp_);
+        if (bound_guidance_temp_) std::free(bound_guidance_temp_);
+        if (class_map_temp_expanded_) std::free(class_map_temp_expanded_);
+        if (boundary_temp_) std::free(boundary_temp_);
+        if (inflate_bound_temp_) std::free(inflate_bound_temp_);
+        if (inflate_class_temp_) std::free(inflate_class_temp_);
+
+        if (robot_kernel_human) std::free(robot_kernel_human);
+        if (robot_kernel_obstacle) std::free(robot_kernel_obstacle);
+        if (hgrid_insertion_old_) std::free(hgrid_insertion_old_);
+        if (hgrid_active_) std::free(hgrid_active_);
+        if (dhdt_active_) std::free(dhdt_active_);
+        if (beta_grid_) std::free(beta_grid_);
+
+        if (outFileCSV.is_open()) outFileCSV.close();
+        if (outFileBIN.is_open()) outFileBIN.close();
+    }
+
+private:
+    // ============================================================
+    // 1. ROS ORCHESTRATION
+    // ============================================================
+
+    void teleop_callback(geometry_msgs::msg::Twist::UniquePtr msg) {
+        handle_teleop_input(*msg);
+    }
+
+    void keyboard_callback(std_msgs::msg::Int32::UniquePtr msg) {
+        handle_keyboard_input(*msg);
+    }
+
+    void occ_grid_callback(nav_msgs::msg::OccupancyGrid::UniquePtr msg) {
+        handle_occupancy_update(*msg);
+    }
+
+    void class_map_callback(nav_msgs::msg::OccupancyGrid::UniquePtr msg) {
+        if (msg->data.size() != IMAX * JMAX) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "class_map size mismatch: got %zu expected %d",
+                msg->data.size(),
+                IMAX * JMAX
+            );
+            return;
+        }
+    
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            class_map[n] = msg->data[n];
+        }
+    }
+
+    void visibility_map_callback(nav_msgs::msg::OccupancyGrid::UniquePtr msg) {
+        if (msg->data.size() != IMAX * JMAX) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "visibility_map size mismatch: got %zu expected %d",
+                msg->data.size(),
+                IMAX * JMAX
+            );
+            return;
+        }
+    
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            visibility_map[n] = msg->data[n];
+        }
+    }
+    void semantic_observation_callback(
+        sensor_msgs::msg::PointCloud2::UniquePtr msg)
+    {
+        handle_semantic_observation(*msg);
+    }
+
+
+    void state_update_callback(const nav_msgs::msg::Odometry::SharedPtr data) {
+        handle_state_update(*data);
+    }
+
+    void mpc_callback() {
+        handle_mpc_update();
+    }
+
+    // ============================================================
+    // 2. HIGH-LEVEL HANDLERS
+    // ============================================================
+    void handle_semantic_observation(
+        const sensor_msgs::msg::PointCloud2& msg)
+    {
+        if (msg.width == 0 || msg.height == 0) {
+            return;
+        }
+
+        if (!msg.header.frame_id.empty() &&
+            msg.header.frame_id != semantic_observation_frame_)
+        {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                2000,
+                "Semantic observation frame is '%s', expected '%s'. "
+                "The current implementation assumes the points are already "
+                "expressed in the semantic_poisson body frame.",
+                msg.header.frame_id.c_str(),
+                semantic_observation_frame_.c_str()
+            );
+
+            return;
+        }
+
+        const float now_sec =
+            std::chrono::duration<float>(
+                std::chrono::steady_clock::now().time_since_epoch()
+            ).count();
+
+        std::size_t valid_points = 0;
+        std::size_t ignored_classes = 0;
+        std::size_t outside_grid = 0;
+        std::size_t outside_height = 0;
+
+        std::lock_guard<std::mutex> lock(
+            semantic_observation_mutex_);
+
+        try {
+            sensor_msgs::PointCloud2ConstIterator<float>
+                iter_x(msg, "x");
+
+            sensor_msgs::PointCloud2ConstIterator<float>
+                iter_y(msg, "y");
+
+            sensor_msgs::PointCloud2ConstIterator<float>
+                iter_z(msg, "z");
+
+            sensor_msgs::PointCloud2ConstIterator<std::uint16_t>
+                iter_class(msg, "class_id");
+
+            for (
+                ;
+                iter_x != iter_x.end();
+                ++iter_x,
+                ++iter_y,
+                ++iter_z,
+                ++iter_class)
+            {
+                const float px = *iter_x;
+                const float py = *iter_y;
+                const float pz = *iter_z;
+
+                if (!std::isfinite(px) ||
+                    !std::isfinite(py) ||
+                    !std::isfinite(pz))
+                {
+                    continue;
+                }
+
+                if (pz < semantic_observation_min_z_ ||
+                    pz > semantic_observation_max_z_)
+                {
+                    ++outside_height;
+                    continue;
+                }
+
+                const std::uint16_t model_class_id =
+                    *iter_class;
+
+                const SemanticClass semantic_class =
+                    topformer_class_to_semantic_class(
+                        model_class_id);
+
+                if (semantic_class == SemanticClass::Unknown) {
+                    ++ignored_classes;
+                    continue;
+                }
+
+                // The semantic_volume cloud is in body_link.
+                //
+                // Existing semantic_poisson grid convention:
+                //   x -> grid column j
+                //   y -> grid row i
+                //   grid origin is centered on body_link.
+                const int j = static_cast<int>(
+                    std::floor(
+                        px / DS +
+                        0.5f * static_cast<float>(JMAX)));
+
+                const int i = static_cast<int>(
+                    std::floor(
+                        py / DS +
+                        0.5f * static_cast<float>(IMAX)));
+
+                if (i < 0 ||
+                    i >= IMAX ||
+                    j < 0 ||
+                    j >= JMAX)
+                {
+                    ++outside_grid;
+                    continue;
+                }
+
+                const int grid_index =
+                    i * JMAX + j;
+
+                const std::size_t class_index =
+                    semantic_class_index(
+                        semantic_class);
+
+                semantic_class_layers_[class_index][grid_index] =
+                    1;
+
+                semantic_class_last_seen_[class_index][grid_index] =
+                    now_sec;
+
+                semantic_model_class_grid_[grid_index] =
+                    model_class_id;
+
+                semantic_canonical_class_grid_[grid_index] =
+                    static_cast<std::uint16_t>(
+                        semantic_class);
+
+                ++valid_points;
+            }
+        } catch (const std::runtime_error& exception) {
+            RCLCPP_ERROR_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                2000,
+                "Invalid semantic PointCloud2 fields: %s",
+                exception.what()
+            );
+
+            return;
+        }
+
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            2000,
+            "OAK semantic observations: accepted=%zu, "
+            "ignored_class=%zu, outside_grid=%zu, outside_z=%zu",
+            valid_points,
+            ignored_classes,
+            outside_grid,
+            outside_height
+        );
+    }
+
+    void expire_stale_semantic_observations()
+    {
+        const float now_sec =
+            std::chrono::duration<float>(
+                std::chrono::steady_clock::now().time_since_epoch()
+            ).count();
+
+        std::lock_guard<std::mutex> lock(
+            semantic_observation_mutex_);
+
+        for (
+            std::size_t class_index = 1;
+            class_index < NUM_CANONICAL_SEMANTIC_CLASSES;
+            ++class_index)
+        {
+            auto& layer =
+                semantic_class_layers_[class_index];
+
+            auto& last_seen =
+                semantic_class_last_seen_[class_index];
+
+            for (int n = 0; n < IMAX * JMAX; ++n) {
+                if (layer[n] == 0) {
+                    continue;
+                }
+
+                const float observation_age =
+                    now_sec - last_seen[n];
+
+                if (observation_age >
+                    semantic_observation_timeout_sec_)
+                {
+                    layer[n] = 0;
+                    last_seen[n] = 0.0f;
+                }
+            }
+        }
+    }
+
+    void merge_active_oak_semantics_into_target_grid()
+    {
+        expire_stale_semantic_observations();
+
+        std::lock_guard<std::mutex> lock(
+            semantic_observation_mutex_
+        );
+
+        for (
+            const SemanticClass semantic_class :
+            active_semantic_classes_)
+        {
+            const std::size_t class_index =
+                semantic_class_index(semantic_class);
+
+            if (class_index == 0 ||
+                class_index >= NUM_CANONICAL_SEMANTIC_CLASSES)
+            {
+                continue;
+            }
+
+            const auto& layer =
+                semantic_class_layers_[class_index];
+
+            for (int n = 0; n < IMAX * JMAX; ++n) {
+                if (layer[n] > 0) {
+                    semantic_target_grid_[n] = 1;
+                }
+            }
+        }
+    }
+
+
+    void handle_teleop_input(const geometry_msgs::msg::Twist& msg) {
+        const std::vector<float> vtb = {
+            static_cast<float>(msg.linear.x),
+            static_cast<float>(msg.linear.y),
+            static_cast<float>(msg.angular.z)
+        };
+
+        vt = {
+            std::cos(x[2]) * vtb[0] - std::sin(x[2]) * vtb[1],
+            std::sin(x[2]) * vtb[0] + std::cos(x[2]) * vtb[1],
+            vtb[2]
+        };
+
+        xd[0] += 0.01f * vt[0];
+        xd[1] += 0.01f * vt[1];
+        xd[2] += 0.01f * vt[2];
+
+        if (!start_flag) {
+            xd = x;
+            vt = {0.0f, 0.0f, 0.0f};
+        }
+    }
+
+    void handle_keyboard_input(const std_msgs::msg::Int32& msg) {
+        if (!save_flag) t_start = std::chrono::steady_clock::now();
+        else t_ms = std::chrono::duration<float>(std::chrono::steady_clock::now() - t_start).count() * 1.0e3f;
+
+        char param = ' ';
+        const int ch = msg.data;
+        switch (ch) {
+            case ' ': space_counter++; if (space_counter >= 1) save_flag = true; if (space_counter >= 3) start_flag = true; if (space_counter >= 6) stop_flag = true; break;
+            case 'r': realtime_sf_flag = !realtime_sf_flag; break;
+            case 'p': predictive_sf_flag = !predictive_sf_flag; break;
+            case 'd':
+                param = current_parameter_deck.back();
+                current_parameter_deck.pop_back();
+                if (current_parameter_deck.empty()) {
+                    current_parameter_deck = sorted_parameter_deck;
+                    std::shuffle(current_parameter_deck.begin(), current_parameter_deck.end(), gen);
+                }
+                break;
+            default: break;
+        }
+
+        apply_parameter_deck_selection(param, ch);
+        maybe_write_experiment_data();
+    }
+
+    void handle_occupancy_update(const nav_msgs::msg::OccupancyGrid& msg) {
+        const auto grid_start = std::chrono::steady_clock::now();
+    
+        if (!update_grid_metadata_from_message(msg)) {
+            return;
+        }
+
+        update_semantic_update_state();
+        preprocess_occupancy();
+        auto semantic_output = run_semantic_fusion();
+
+        build_inflated_boundaries(semantic_output.tight_area);
+
+        auto guidance_output = build_guidance_field(semantic_output.active_tracks);
+
+        bool solved = solve_safety_field(guidance_output);
+
+        if (start_flag && dhdt_flag) {
+            ScopedTimer timer(timing_.dhdt_update_ms);
+            update_temporal_field_derivative();
+        }
+
+        if (solved) {
+            copy_current_globals_into_pending_field();
+
+            {
+                std::unique_lock<std::shared_mutex> lock(field_mutex_);
+                std::swap(active_field_, pending_field_);
+                latest_field_timestamp_ = active_field_.timestamp;
+                h_flag = active_field_.valid;
+            }
+        }
+    
+        timing_.end_to_end_grid_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - grid_start).count();
+
+        // RCLCPP_ERROR_THROTTLE(
+        //     this->get_logger(),
+        //     *this->get_clock(),
+        //     1000,
+        //     "Before render: enable_display=%d h_flag=%d hgrid_active=%p",
+        //     enable_display,
+        //     h_flag,
+        //     static_cast<void*>(hgrid_active_)
+        // );
+    
+        if (enable_display) render_visualization();
+        
+        if (should_publish_logging_now()) {
+            publish_logging_data();
+            publish_profiling_data();
+        }
+    }
+
+
+
+
+    void handle_state_update(const nav_msgs::msg::Odometry& data) {
+        update_robot_state(data);
+    
+        std::vector<float> v_input_body = form_nominal_body_command();
+    
+        {
+            std::shared_lock<std::shared_mutex> lock(field_mutex_);
+
+            timing_.field_data_age_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - active_field_.timestamp
+                ).count();
+
+            ScopedTimer timer(timing_.realtime_filter_ms);
+
+            if (active_field_.valid) {
+                float* old_hgrid_active = hgrid_active_;
+                float* old_dhdt_active = dhdt_active_;
+                float* old_beta_grid = beta_grid_;
+                float* old_guidance_x_grid = guidance_x_grid;
+                float* old_guidance_y_grid = guidance_y_grid;
+
+                hgrid_active_ = active_field_.hgrid.data();
+                dhdt_active_ = active_field_.dhdt.data();
+                beta_grid_ = active_field_.beta.data();
+                guidance_x_grid = active_field_.guidance_x.data();
+                guidance_y_grid = active_field_.guidance_y.data();
+
+                compute_realtime_safe_control(v_input_body);
+
+                hgrid_active_ = old_hgrid_active;
+                dhdt_active_ = old_dhdt_active;
+                beta_grid_ = old_beta_grid;
+                guidance_x_grid = old_guidance_x_grid;
+                guidance_y_grid = old_guidance_y_grid;
+            } else {
+                v = v_input_body;
+            }
+        }
+    
+        postprocess_command();
+    
+        {
+            ScopedTimer timer(timing_.command_dispatch_ms);
+            dispatch_robot_command();
+        }
+    }
+
+    void handle_mpc_update() {
+        if (!(predictive_sf_flag && h_flag && mpc_mutex.try_lock())) return;
+        std::lock_guard<std::mutex> lock(mpc_mutex, std::adopt_lock);
+    
+        std::shared_lock<std::shared_mutex> field_lock(field_mutex_);
+        ScopedTimer timer(timing_.predictive_control_ms);
+
+        if (active_field_.valid) {
+            float* old_hgrid_active = hgrid_active_;
+            float* old_dhdt_grid = dhdt_grid;
+            float* old_beta_grid = beta_grid_;
+            float* old_guidance_x_grid = guidance_x_grid;
+            float* old_guidance_y_grid = guidance_y_grid;
+
+            hgrid_active_ = active_field_.hgrid.data();
+            dhdt_grid = active_field_.dhdt.data();
+            beta_grid_ = active_field_.beta.data();
+            guidance_x_grid = active_field_.guidance_x.data();
+            guidance_y_grid = active_field_.guidance_y.data();
+
+            compute_predictive_control();
+
+            hgrid_active_ = old_hgrid_active;
+            dhdt_grid = old_dhdt_grid;
+            beta_grid_ = old_beta_grid;
+            guidance_x_grid = old_guidance_x_grid;
+            guidance_y_grid = old_guidance_y_grid;
+        }
+    }
+
+    // ============================================================
+    // 3. PIPELINE: OCCUPANCY / SEMANTICS / GEOMETRY
+    // ============================================================
+
+    void preprocess_occupancy() {
+        ScopedTimer timer(timing_.occupancy_preprocess_ms);
+    
+        build_occ_map(occ1, occ0, conf);
+    
+        // Only copy layer q=0 instead of entire grid
+        std::memcpy(
+            hgrid_temp_,
+            hgrid1,
+            IMAX * JMAX * QMAX * sizeof(float)
+        );
+    
+        find_boundary(hgrid_temp_, occ1, false, false, nullptr);
+    }
+
+    SemanticStageOutput run_semantic_fusion() {
+        ScopedTimer timer(timing_.semantic_fusion_ms);
+        SemanticStageOutput out;
+
+        std::fill(
+            semantic_target_grid_.begin(),
+            semantic_target_grid_.end(),
+            0);
+
+        // ------------------------------------------------------------
+        // Legacy YOLO/human semantic source
+        // ------------------------------------------------------------
+        if (enable_legacy_yolo_semantics_) {
+            label_human_clusters(occ1);
+
+            for (int n = 0; n < IMAX * JMAX; ++n) {
+                if (class_map_expanded[n] > 0) {
+                    semantic_target_grid_[n] = 1;
+                }
+            }
+        }
+
+        // ------------------------------------------------------------
+        // New OAK/TopFormer class-labelled semantic source
+        // ------------------------------------------------------------
+        if (enable_oak_semantic_observations_) {
+            merge_active_oak_semantics_into_target_grid();
+        }
+
+        out.active_tracks = human_tracker_->get_active_tracks();
+
+        semantic_occupancy_grid_.swap(semantic_target_grid_);
+        apply_relational_constraints_to_semantic_map(out.active_tracks);
+        semantic_target_grid_.swap(semantic_occupancy_grid_);
+
+        update_interpolated_semantic_grid();
+        publish_semantic_occupancy_grid();
+
+        out.tight_area = is_tight_area();
+        return out;
+    }
+
+    void apply_relational_constraints_to_semantic_map(
+        const std::vector<HumanTrack>& tracks
+    ) {
+        std::fill(relational_debug_grid_.begin(), relational_debug_grid_.end(), 0);
+        if (tracks.empty()) {
+            return;
+        }
+
+        int added_cells_total = 0;
+
+        for (const auto& rc : constraint_runtime_config_.constraints) {
+            if (!rc.enabled || !rc.enforce) {
+                continue;
+            }
+
+            if (rc.type != ConstraintType::Relational) {
+                continue;
+            }
+
+            bool target_is_robot = false;
+            for (const auto& target : rc.target_classes) {
+                if (target == "robot") {
+                    target_is_robot = true;
+                    break;
+                }
+            }
+
+            bool reference_is_person = false;
+            for (const auto& ref : rc.reference_classes) {
+                if (ref == "person" || ref == "human") {
+                    reference_is_person = true;
+                    break;
+                }
+            }
+
+            if (!target_is_robot || !reference_is_person) {
+                continue;
+            }
+
+            const float min_radius_m =
+                rc.min_radius_m > 0.0f ? rc.min_radius_m : 0.0f;
+
+            const float max_radius_m =
+                rc.max_radius_m > 0.0f ?
+                    rc.max_radius_m :
+                    (rc.radius_m > 0.0f ? rc.radius_m : 2.0f);
+
+            const float cone_half_angle_deg =
+                rc.cone_half_angle_deg > 0.0f ? rc.cone_half_angle_deg : 60.0f;
+
+            const float cone_half_angle_rad =
+                cone_half_angle_deg * static_cast<float>(M_PI) / 180.0f;
+
+            const float cos_cone =
+                std::cos(cone_half_angle_rad);
+
+            const float heading_timeout_sec =
+                rc.heading_timeout_sec > 0.0f ? rc.heading_timeout_sec : 5.0f;
+
+            const float now_sec = human_tracker_->get_current_time();
+
+            int added_cells_for_constraint = 0;
+            int tracks_seen = 0;
+            int tracks_heading_valid = 0;
+            int tracks_not_timed_out = 0;
+            int cells_in_radius = 0;
+            int cells_in_selected_halfspace = 0;
+            int cells_in_selected_region = 0;
+            int cells_marked_forbidden = 0;
+
+            for (const auto& track : tracks) {
+                tracks_seen++;
+
+                if (!track.heading_valid) {
+                    continue;
+                }
+
+                if (!track.yolo_confirmed && !track.yolo_ever_confirmed) {
+                    continue;
+                }
+
+                if (track.confidence < 0.15f) {
+                    continue;
+                }
+
+                tracks_heading_valid++;
+
+                const float heading_age =
+                    now_sec - track.last_update_time;
+
+                if (heading_age > heading_timeout_sec) {
+                    continue;
+                }
+
+                tracks_not_timed_out++;
+
+                float hx = track.heading_x;
+                float hy = track.heading_y;
+
+                const float hnorm = std::sqrt(hx * hx + hy * hy);
+                if (hnorm < 1.0e-3f) {
+                    continue;
+                }
+
+                hx /= hnorm;
+                hy /= hnorm;
+
+                float cone_x = hx;
+                float cone_y = hy;
+
+                if (rc.relation == "behind") {
+                    cone_x = -hx;
+                    cone_y = -hy;
+                } else if (rc.relation == "in_front_of") {
+                    cone_x = hx;
+                    cone_y = hy;
+                } else if (rc.relation == "left_of") {
+                    cone_x = -hy;
+                    cone_y = hx;
+                } else if (rc.relation == "right_of") {
+                    cone_x = hy;
+                    cone_y = -hx;
+                } else {
+                    continue;
+                }
+
+                const std::string mode =
+                    rc.mode.empty() ? "forbid_region" : rc.mode;
+
+                for (int i = 0; i < IMAX; ++i) {
+                    for (int j = 0; j < JMAX; ++j) {
+                        const int n = i * JMAX + j;
+
+                        const float cell_x =
+                            (static_cast<float>(j) -
+                            0.5f * static_cast<float>(JMAX)) * DS;
+
+                        const float cell_y =
+                            (static_cast<float>(i) -
+                            0.5f * static_cast<float>(IMAX)) * DS;
+
+                        const float rx = cell_x - track.x;
+                        const float ry = cell_y - track.y;
+
+                        const float dist =
+                            std::sqrt(rx * rx + ry * ry);
+
+                        if (dist < min_radius_m ||
+                            dist > max_radius_m) {
+                            continue;
+                        }
+
+                        cells_in_radius++;
+
+                        const float dot =
+                            rx * cone_x + ry * cone_y;
+
+                        if (dot > 0.0f) {
+                            cells_in_selected_halfspace++;
+                        }
+
+                        const float cos_angle =
+                            dot / dist;
+
+                        const bool inside_selected_region =
+                            (dot > 0.0f) && (cos_angle >= cos_cone);
+
+                        if (inside_selected_region) {
+                            cells_in_selected_region++;
+                        }
+
+                        bool mark_forbidden = false;
+
+                        if (mode == "forbid_region") {
+                            mark_forbidden = inside_selected_region;
+                        } else if (mode == "allow_region") {
+                            mark_forbidden = !inside_selected_region;
+                        } else {
+                            continue;
+                        }
+
+                        if (inside_selected_region) {
+                            relational_debug_grid_[n] = 1;
+                        }
+
+                        if (mark_forbidden) {
+                            relational_debug_grid_[n] = 100;
+                        }
+
+                        if (!mark_forbidden) {
+                            continue;
+                        }
+
+                        cells_marked_forbidden++;
+
+                        if (semantic_occupancy_grid_[n] != 1) {
+                            added_cells_for_constraint++;
+                        }
+
+                        semantic_occupancy_grid_[n] = 1;
+                    }
+                }
+            }
+
+            added_cells_total += added_cells_for_constraint;
+
+            // RCLCPP_INFO_THROTTLE(
+            //     this->get_logger(),
+            //     *this->get_clock(),
+            //     1000,
+            //     "Relational '%s': relation=%s, mode=%s, tracks=%d, heading_valid=%d, not_timed_out=%d, in_radius=%d, selected_region=%d, forbidden=%d, added_cells=%d",
+            //     rc.id.c_str(),
+            //     rc.relation.c_str(),
+            //     rc.mode.c_str(),
+            //     tracks_seen,
+            //     tracks_heading_valid,
+            //     tracks_not_timed_out,
+            //     cells_in_radius,
+            //     cells_in_selected_region,
+            //     cells_marked_forbidden,
+            //     added_cells_for_constraint
+            // );
+        }
+
+        nav_msgs::msg::OccupancyGrid msg;
+        msg.header.stamp = rclcpp::Time(0);
+        msg.header.frame_id = "body_link";
+
+        msg.info.resolution = DS;
+        msg.info.width = JMAX;
+        msg.info.height = IMAX;
+
+        msg.info.origin.position.x = -0.5f * JMAX * DS;
+        msg.info.origin.position.y = -0.5f * IMAX * DS;
+        msg.info.origin.position.z = 0.0;
+
+        msg.info.origin.orientation.w = 1.0;
+
+        msg.data.assign(
+            relational_debug_grid_.begin(),
+            relational_debug_grid_.end()
+        );
+
+        relational_debug_pub_->publish(msg);
+
+        if (added_cells_total > 0) {
+            // RCLCPP_INFO_THROTTLE(
+            //     this->get_logger(),
+            //     *this->get_clock(),
+            //     1000,
+            //     "Relational constraints added total cells=%d",
+            //     added_cells_total
+            // );
+        }
+    }
+
+    void inflate_grid_with_kernel(
+        float* grid,
+        const float* kernel,
+        int kernel_dim)
+    {
+        if (!grid || !kernel || kernel_dim <= 0) {
+            return;
+        }
+
+        const int grid_size = IMAX * JMAX;
+        const int center = kernel_dim / 2;
+
+        // Snapshot the original source occupancy.
+        // Newly inflated cells must not become new inflation sources.
+        std::vector<float> source_grid(
+            grid,
+            grid + grid_size
+        );
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int source_index =
+                    i * JMAX + j;
+
+                // Only original occupied cells seed a kernel.
+                if (source_grid[source_index] >= 0.0f) {
+                    continue;
+                }
+
+                for (int ki = 0; ki < kernel_dim; ++ki) {
+                    const int destination_i =
+                        i + ki - center;
+
+                    if (destination_i < 0 ||
+                        destination_i >= IMAX)
+                    {
+                        continue;
+                    }
+
+                    for (int kj = 0; kj < kernel_dim; ++kj) {
+                        const int destination_j =
+                            j + kj - center;
+
+                        if (destination_j < 0 ||
+                            destination_j >= JMAX)
+                        {
+                            continue;
+                        }
+
+                        const float kernel_value =
+                            kernel[
+                                ki * kernel_dim + kj
+                            ];
+
+                        // Convention: negative means occupied.
+                        if (kernel_value >= 0.0f) {
+                            continue;
+                        }
+
+                        const int destination_index =
+                            destination_i * JMAX +
+                            destination_j;
+
+                        grid[destination_index] =
+                            std::min(
+                                grid[destination_index],
+                                kernel_value
+                            );
+                    }
+                }
+            }
+        }
+
+        for (int n = 0; n < grid_size; ++n) {
+            grid[n] = std::clamp(
+                grid[n],
+                -1.0f,
+                0.0f
+            );
+        }
+    }
+
+    void build_inflated_boundaries(bool tight_area)
+    {
+        ScopedTimer timer(timing_.geometry_shaping_ms);
+
+        const int grid_size = IMAX * JMAX;
+
+        #pragma omp parallel for num_threads(4)
+        for (int q = 0; q < QMAX; ++q) {
+            float* bound_slice =
+                bound + q * grid_size;
+
+            float* hgrid_slice =
+                hgrid_temp_ + q * grid_size;
+
+            // --------------------------------------------------------
+            // 1. Physical occupancy only
+            // --------------------------------------------------------
+            std::memcpy(
+                bound_slice,
+                occ1,
+                grid_size * sizeof(float)
+            );
+
+            inflate_grid_with_kernel(
+                bound_slice,
+                robot_kernel_obstacle +
+                    q * robot_kernel_dim_obstacle *
+                    robot_kernel_dim_obstacle,
+                robot_kernel_dim_obstacle
+            );
+
+            // --------------------------------------------------------
+            // 2. Semantic-human occupancy only
+            // --------------------------------------------------------
+            std::vector<float> human_bound(
+                grid_size,
+                0.0f
+            );
+
+            for (int n = 0; n < grid_size; ++n) {
+                if (semantic_current_grid_[n] > 0) {
+                    human_bound[n] = -1.0f;
+                }
+            }
+
+            inflate_grid_with_kernel(
+                human_bound.data(),
+                robot_kernel_human +
+                    q * robot_kernel_dim_human *
+                    robot_kernel_dim_human,
+                robot_kernel_dim_human
+            );
+
+            // --------------------------------------------------------
+            // 3. Union physical and human occupancy
+            // --------------------------------------------------------
+            for (int n = 0; n < grid_size; ++n) {
+                bound_slice[n] = std::min(
+                    bound_slice[n],
+                    human_bound[n]
+                );
+            }
+
+            find_boundary(
+                hgrid_slice,
+                bound_slice,
+                true,
+                tight_area,
+                semantic_current_grid_.data()
+            );
+        }
+    }
+
+    // ============================================================
+    // 4. PIPELINE: GUIDANCE / SAFETY FIELD
+    // ============================================================
+
+    GuidanceStageOutput build_guidance_field(const std::vector<HumanTrack>& active_tracks) {
+        GuidanceStageOutput out;
+        out.bound_guidance = bound;
+
+        std::memset(guidance_x_temp_, 0, IMAX * JMAX * QMAX * sizeof(float));
+        std::memset(guidance_y_temp_, 0, IMAX * JMAX * QMAX * sizeof(float));
+        std::memset(forcing_zero_temp_, 0, IMAX * JMAX * QMAX * sizeof(float));
+        std::memset(tangent_layer_display, 0, IMAX * JMAX * sizeof(int8_t));
+
+        const float c_yaw = std::cos(x[2]);
+        const float s_yaw = std::sin(x[2]);
+        const float vn_body_x = c_yaw * vn[0] + s_yaw * vn[1];
+        const float vn_body_y = -s_yaw * vn[0] + c_yaw * vn[1];
+        
+        {
+            ScopedTimer timer(timing_.guidance_boundary_setup_ms);
+        
+            compute_boundary_gradients(guidance_x_temp_, guidance_y_temp_, bound, semantic_current_grid_.data(),
+                                       x[0], x[1], vn_body_x, vn_body_y, true);
+        
+            #pragma omp parallel for num_threads(4)
+            for (int q = 1; q < QMAX; ++q) {
+                float* bound_slice = bound + q * IMAX * JMAX;
+                float* gx = guidance_x_temp_ + q * IMAX * JMAX;
+                float* gy = guidance_y_temp_ + q * IMAX * JMAX;
+                compute_boundary_gradients(gx, gy, bound_slice, semantic_current_grid_.data(),
+                                           x[0], x[1], vn_body_x, vn_body_y, false);
+            }
+        }
+
+        {
+            ScopedTimer timer(timing_.guidance_social_expansion_ms);
+        
+            if (enable_social_navigation_ && social_tangent_layers_ > 0 && !human_boundary_info_.empty()) {
+                out.bound_guidance = bound_guidance_temp_;
+                const float sign = compute_tangent_direction(active_tracks, 0.0f, 0.0f, vn_body_x, vn_body_y);
+                for (int q = 0; q < QMAX; ++q) {
+                    expand_human_obstacles_for_guidance(
+                        bound_guidance_temp_ + q * IMAX * JMAX,
+                        guidance_x_temp_ + q * IMAX * JMAX,
+                        guidance_y_temp_ + q * IMAX * JMAX,
+                        bound + q * IMAX * JMAX,
+                        social_tangent_layers_,
+                        social_layer_thickness_,
+                        social_tangent_bias_,
+                        sign);
+                }
+            }
+        }
+
+        {
+            ScopedTimer timer(timing_.guidance_laplace_ms);
+            solve_guidance_laplace(out.bound_guidance);
+        }
+        
+        compute_guidance_forcing(out.bound_guidance);
+
+        {
+            ScopedTimer timer(timing_.guidance_copyout_ms);
+        
+            std::memcpy(guidance_x_display, guidance_x_temp_, IMAX * JMAX * sizeof(float));
+            std::memcpy(guidance_y_display, guidance_y_temp_, IMAX * JMAX * sizeof(float));
+            std::memcpy(bound_display, bound, IMAX * JMAX * sizeof(float));
+            std::memcpy(guidance_x_grid, guidance_x_temp_, IMAX * JMAX * QMAX * sizeof(float));
+            std::memcpy(guidance_y_grid, guidance_y_temp_, IMAX * JMAX * QMAX * sizeof(float));
+        }
+        return out;
+    }
+
+    void solve_guidance_laplace(float* bound_guidance) {
+        const float v_RelTol = 1.0e-3f;
+        const int N_guidance = IMAX / 5;
+        const float w_SOR_guidance = 2.0f / (1.0f + std::sin(M_PI / static_cast<float>(N_guidance + 1)));
+        (void)Kernel::poissonSolve(guidance_x_temp_, forcing_zero_temp_, bound_guidance, v_RelTol, w_SOR_guidance);
+        (void)Kernel::poissonSolve(guidance_y_temp_, forcing_zero_temp_, bound_guidance, v_RelTol, w_SOR_guidance);
+    }
+
+    void compute_guidance_forcing(const float* bound_guidance) {
+        #pragma omp parallel for num_threads(4)
+        for (int q = 0; q < QMAX; ++q) {
+            float* force_slice = force + q * IMAX * JMAX;
+            const float* bound_slice = bound_guidance + q * IMAX * JMAX;
+            float* gx = guidance_x_temp_ + q * IMAX * JMAX;
+            float* gy = guidance_y_temp_ + q * IMAX * JMAX;
+            compute_optimal_forcing_function(force_slice, gx, gy, bound_slice);
+            for (int n = 0; n < IMAX * JMAX; ++n) force_slice[n] *= DS * DS;
+        }
+    }
+
+    bool solve_safety_field(const GuidanceStageOutput& guidance){
+        ScopedTimer timer(timing_.safety_field_solve_ms);
+    
+        const float relTol = 1.0e-3f;
+        const int N = IMAX / 5;
+        const float w_SOR = 2.0f / (1.0f + std::sin(M_PI / static_cast<float>(N + 1)));
+    
+        bool success = true;
+        if (!hgrid_temp_ || !force || !guidance.bound_guidance) {
+            success = false;
+        } else {
+            (void)Kernel::poissonSolve(hgrid_temp_, force, guidance.bound_guidance, relTol, w_SOR);
+            // optional: add finite-value checks here
+}
+        std::memcpy(occ0, occ1, IMAX * JMAX * sizeof(float));
+        std::memcpy(hgrid0, hgrid1, IMAX * JMAX * QMAX * sizeof(float));
+        std::memcpy(hgrid1, hgrid_temp_, IMAX * JMAX * QMAX * sizeof(float));
+    
+        if (success) {
+            dhdt_flag = true;
+        }
+    
+        return success;
+    }
+
+    void update_temporal_field_derivative() {
+        const float wc = 10.0f;
+        const float kc = 1.0f - std::exp(-wc * dt_grid);
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                for (int q = 0; q < QMAX; ++q) {
+                    const float i0 = static_cast<float>(i) + dx[1] / DS;
+                    const float j0 = static_cast<float>(j) + dx[0] / DS;
+                    const bool in_grid = (i0 >= 0.0f) && (i0 <= static_cast<float>(IMAX - 1)) &&
+                                         (j0 >= 0.0f) && (j0 <= static_cast<float>(JMAX - 1));
+                    float dhdt_ij = 0.0f;
+                    if (in_grid) {
+                        const float h0v = trilinear_interpolation(hgrid0, i0, j0, q);
+                        const float h1v = trilinear_interpolation(hgrid1, i, j, q);
+                        dhdt_ij = (h1v - h0v) / dt_grid;
+                    }
+                    dhdt_grid[q * IMAX * JMAX + i * JMAX + j] *= 1.0f - kc;
+                    dhdt_grid[q * IMAX * JMAX + i * JMAX + j] += kc * dhdt_ij;
+                }
+            }
+        }
+    }
+
+    // ============================================================
+    // 5. CONTROL
+    // ============================================================
+
+    void compute_predictive_control() {
+        std::vector<float> x_body_link = {0.0f, 0.0f, x[2]};
+        for (int i = 0; i < MAX_SQP_ITERS; ++i) {
+            const float c = std::cos(x[2]);
+            const float s = std::sin(x[2]);
+            std::vector<float> vn_body = {c * vn[0] + s * vn[1], -s * vn[0] + c * vn[1], vn[2]};
+            mpc3d_controller.update_cost(vn_body);
+
+            mpc3d_controller.set_alpha_optimization_enabled(
+                semantic_update_.active,
+                std::exp(-wn * DT)
+            );
+
+            mpc3d_controller.update_constraints(hgrid_active_, dhdt_grid, beta_grid_, guidance_x_grid, guidance_y_grid,
+                                                x_body_link, xc, grid_age, wn, issf,
+                                                cbf_sigma_epsilon_, cbf_sigma_kappa_);
+            mpc3d_controller.solve();
+
+            if (mpc3d_controller.update_residual() < 1.0f) break;
+        }
+        mpc3d_controller.set_input(vd);
+    }
+
+    std::vector<float> form_nominal_body_command() {
+        vn = vt;
+        if (predictive_sf_flag) return vd;
+        const float c = std::cos(x[2]);
+        const float s = std::sin(x[2]);
+        return {c * vn[0] + s * vn[1], -s * vn[0] + c * vn[1], vn[2]};
+    }
+
+    void compute_realtime_safe_control(const std::vector<float>& v_input_body) {
+        // Keep your existing safety_filter math here unchanged for now.
+        safety_filter(v_input_body);
+    }
+
+    void postprocess_command() {
+        const std::vector<float> vb_new = v;
+        low_pass(vb, vb_new, 5.0f, dt_state);
+        if (std::abs(vb[0]) > 10.0f || std::abs(vb[1]) > 10.0f || std::abs(vb[2]) > 10.0f) sit_flag = true;
+        float runtime_vx_fwd = vel_max_x_fwd_;
+        float runtime_vx_bwd = vel_max_x_bwd_;
+        float runtime_vy = vel_max_y_;
+        float runtime_wz = vel_max_yaw_;
+
+        apply_velocity_limit_constraints(
+            runtime_vx_fwd,
+            runtime_vx_bwd,
+            runtime_vy,
+            runtime_wz
+        );
+    
+        vb[0] = std::clamp(vb[0], -runtime_vx_bwd, runtime_vx_fwd);
+        vb[1] = std::clamp(vb[1], -runtime_vy, runtime_vy);
+        vb[2] = std::clamp(vb[2], -runtime_wz, runtime_wz);
+        
+    }
+
+    void apply_velocity_limit_constraints(
+        float& vx_fwd,
+        float& vx_bwd,
+        float& vy,
+        float& wz
+    ) {
+        if (!human_tracker_) {
+            return;
+        }
+    
+        const auto tracks = human_tracker_->get_active_tracks();
+    
+        if (tracks.empty()) {
+            return;
+        }
+    
+        for (const auto& rc : constraint_runtime_config_.constraints) {
+            if (!rc.enabled || !rc.enforce) {
+                continue;
+            }
+    
+            if (rc.type != ConstraintType::VelocityLimit) {
+                continue;
+            }
+    
+            bool targets_person = false;
+            for (const auto& target : rc.target_classes) {
+                if (target == "person" || target == "human") {
+                    targets_person = true;
+                    break;
+                }
+            }
+    
+            if (!targets_person) {
+                continue;
+            }
+    
+            if (rc.buffer_distance_m <= 0.0f) {
+                continue;
+            }
+    
+            bool near_person = false;
+    
+            for (const auto& track : tracks) {
+                const float d = std::sqrt(track.x * track.x + track.y * track.y);
+    
+                if (d <= rc.buffer_distance_m) {
+                    near_person = true;
+                    break;
+                }
+            }
+    
+            if (!near_person) {
+                continue;
+            }
+    
+            if (rc.max_linear_velocity_mps > 0.0f) {
+                vx_fwd = std::min(vx_fwd, rc.max_linear_velocity_mps);
+                vx_bwd = std::min(vx_bwd, rc.max_linear_velocity_mps);
+                vy = std::min(vy, rc.max_linear_velocity_mps);
+            }
+    
+            if (rc.max_angular_velocity_radps > 0.0f) {
+                wz = std::min(wz, rc.max_angular_velocity_radps);
+            }
+    
+        //     RCLCPP_INFO_THROTTLE(
+        //         this->get_logger(),
+        //         *this->get_clock(),
+        //         1000,
+        //         "Velocity limit active from constraint '%s': linear<=%.2f, yaw<=%.2f",
+        //         rc.id.c_str(),
+        //         vx_fwd,
+        //         wz
+        //     );
+        // }
+        }
+    }
+
+    void dispatch_robot_command() {
+        if (stop_flag) {
+            sport_req.StopMove(req);
+            sport_req.StandDown(req);
+            rclcpp::shutdown();
+        } else if (sit_flag) {
+            sport_req.StopMove(req);
+            sport_req.StandDown(req);
+        } else if (start_flag) {
+            sport_req.Move(req, vb[0], vb[1], vb[2]);
+        }
+    }
+
+    // ============================================================
+    // 6. VISUALIZATION / LOGGING / EXPERIMENT SUPPORT
+    // ============================================================
+
+    void render_visualization() {
+        if (!poisson_image_pub_) {
+            return;
+        }
+
+        std::shared_lock<std::shared_mutex> lock(field_mutex_);
+
+        if (!active_field_.valid ||
+            active_field_.hgrid.empty() ||
+            active_field_.bound.empty()) {
+            return;
+        }
+
+        const float* hgrid_vis = active_field_.hgrid.data();
+        const float* bound_vis = active_field_.bound.data();
+
+        const int q_vis = QMAX / 2;
+        const int scale = 6;
+
+        cv::Mat h_u8(IMAX, JMAX, CV_8UC1);
+        cv::Mat boundary_u8(IMAX, JMAX, CV_8UC1, cv::Scalar(0));
+
+        float h_min = 1.0e9f;
+        float h_max = -1.0e9f;
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int n3 = q_vis * IMAX * JMAX + i * JMAX + j;
+                const float hv = hgrid_vis[n3];
+
+                h_min = std::min(h_min, hv);
+                h_max = std::max(h_max, hv);
+            }
+        }
+
+        const float display_min = 0.0f;
+        const float display_max = std::max(0.40f, h_max);
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int n2 = i * JMAX + j;
+                const int n3 = q_vis * IMAX * JMAX + n2;
+
+                float hv = hgrid_vis[n3];
+                hv = std::clamp(hv, display_min, display_max);
+
+                const float normalized =
+                    (hv - display_min) /
+                    (display_max - display_min + 1.0e-6f);
+
+                h_u8.at<uint8_t>(i, j) =
+                    static_cast<uint8_t>(255.0f * normalized);
+
+                if (bound_vis[n3] <= 0.0f) {
+                    boundary_u8.at<uint8_t>(i, j) = 255;
+                }
+            }
+        }
+
+        cv::Mat h_color;
+        cv::applyColorMap(h_u8, h_color, cv::COLORMAP_TURBO);
+
+        cv::Mat boundary_color(IMAX, JMAX, CV_8UC3, cv::Scalar(0, 0, 0));
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                if (boundary_u8.at<uint8_t>(i, j) > 0) {
+                    boundary_color.at<cv::Vec3b>(i, j) =
+                        cv::Vec3b(255, 255, 255);
+                }
+            }
+        }
+
+        cv::Mat overlay = h_color.clone();
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                if (boundary_u8.at<uint8_t>(i, j) > 0) {
+                    overlay.at<cv::Vec3b>(i, j) =
+                        cv::Vec3b(255, 255, 255);
+                }
+            }
+        }
+
+        cv::Mat combined;
+        cv::hconcat(
+            std::vector<cv::Mat>{h_color, boundary_color, overlay},
+            combined
+        );
+
+        cv::Mat display_img;
+        cv::resize(
+            combined,
+            display_img,
+            cv::Size(),
+            scale,
+            scale,
+            cv::INTER_NEAREST
+        );
+
+        sensor_msgs::msg::Image msg;
+        msg.header.stamp = this->now();
+        msg.header.frame_id = "map";
+        msg.height = display_img.rows;
+        msg.width = display_img.cols;
+        msg.encoding = "bgr8";
+        msg.is_bigendian = false;
+        msg.step = static_cast<sensor_msgs::msg::Image::_step_type>(
+            display_img.cols * display_img.elemSize()
+        );
+
+        msg.data.assign(
+            display_img.data,
+            display_img.data + display_img.total() * display_img.elemSize()
+        );
+
+        poisson_image_pub_->publish(msg);
+    }
+
+    bool should_publish_logging_now() {
+        const auto now = std::chrono::steady_clock::now();
+
+        const double time_since_last =
+            std::chrono::duration<double>(
+                now - last_logging_publish_time_
+            ).count();
+
+        if (time_since_last < logging_publish_period_) {
+            return false;
+        }
+
+        last_logging_publish_time_ = now;
+        return true;
+    }
+
+    void publish_profiling_data() {
+        if (!profiling_data_pub_) return;
+    
+        std_msgs::msg::Float32MultiArray msg;
+        msg.data = {
+            static_cast<float>(timing_.occupancy_preprocess_ms),
+            static_cast<float>(timing_.semantic_fusion_ms),
+            static_cast<float>(timing_.geometry_shaping_ms),
+    
+            static_cast<float>(timing_.guidance_boundary_setup_ms),
+            static_cast<float>(timing_.guidance_social_expansion_ms),
+            static_cast<float>(timing_.guidance_laplace_ms),
+            static_cast<float>(timing_.guidance_copyout_ms),
+    
+            static_cast<float>(timing_.safety_field_solve_ms),
+            static_cast<float>(timing_.dhdt_update_ms),
+            static_cast<float>(timing_.predictive_control_ms),
+            static_cast<float>(timing_.realtime_filter_ms),
+            static_cast<float>(timing_.command_dispatch_ms),
+            static_cast<float>(timing_.field_data_age_ms),
+            static_cast<float>(timing_.end_to_end_grid_ms)
+        };
+    
+        profiling_data_pub_->publish(msg);
+    }
+
+    void refresh_grid_temp_for_logging() {
+        const float qr = yaw_to_q(x[2], xc[2]);
+        const float q1f = std::floor(qr);
+        const float q2f = std::ceil(qr);
+        const int q1 = static_cast<int>(q_wrap(q1f));
+        const int q2 = static_cast<int>(q_wrap(q2f));
+    
+        #pragma omp parallel for
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            if (q1f != q2f) {
+                grid_temp[n] =
+                    (q2f - qr) * hgrid_active_[q1 * IMAX * JMAX + n] +
+                    (qr - q1f) * hgrid_active_[q2 * IMAX * JMAX + n];
+            } else {
+                grid_temp[n] = hgrid_active_[q1 * IMAX * JMAX + n];
+            }
+        }
+    }
+
+    void maybe_write_experiment_data() {
+        if (!(save_flag && enable_data_logging_to_file_)) return;
+        const std::vector<float> save_data = {
+            t_ms,
+            static_cast<float>(space_counter),
+            x[0], x[1], x[2],
+            // Realtime safety command
+            v[0], v[1], v[2],
+            // MPC output
+            vd[0], vd[1], vd[2],
+            // Measured body velocity
+            v_meas_body[0], v_meas_body[1], v_meas_body[2],
+            // MPC tracking error
+            vd[0] - v_meas_body[0],
+            vd[1] - v_meas_body[1],
+            vd[2] - v_meas_body[2],
+            h, dhdx, dhdy, dhdq, dhdt,
+            wn,
+            static_cast<float>(realtime_sf_flag | predictive_sf_flag),
+            semantic_update_.lambda,
+            semantic_update_.lambda_dot,
+            static_cast<float>(semantic_update_.active),
+            new_constraint_event_flag_ ? 1.0f : 0.0f,
+            static_cast<float>(constraint_event_counter_)
+        };
+
+        for (size_t n = 0; n < save_data.size(); ++n) {
+            outFileCSV << save_data[n];
+            if (n + 1 < save_data.size()) outFileCSV << ",";
+        }
+        outFileCSV << std::endl;
+        const int factor = 7;
+        if (!(poisson_save_counter % factor)) {
+            refresh_grid_temp_for_logging();
+            outFileBIN.write(reinterpret_cast<char*>(grid_temp), sizeof(grid_temp));
+        }
+        poisson_save_counter++;
+    }
+
+    void apply_parameter_deck_selection(char param, int ch) {
+        switch (param) {
+            case '0': predictive_sf_flag = false; realtime_sf_flag = false; wn = 16.0f; break;
+            case '1': predictive_sf_flag = true; realtime_sf_flag = true; wn = 0.5f; break;
+            case '2': predictive_sf_flag = true; realtime_sf_flag = true; wn = 1.0f; break;
+            case '3': predictive_sf_flag = true; realtime_sf_flag = true; wn = 1.5f; break;
+            case '4': predictive_sf_flag = true; realtime_sf_flag = true; wn = 2.0f; break;
+            case '5': predictive_sf_flag = true; realtime_sf_flag = true; wn = 4.0f; break;
+            case '6': predictive_sf_flag = true; realtime_sf_flag = true; wn = 8.0f; break;
+            default: break;
+        }
+        switch (ch) {
+            case '1': wn = 0.5f; break;
+            case '2': wn = 1.0f; break;
+            case '3': wn = 1.5f; break;
+            case '4': wn = 2.0f; break;
+            case '5': wn = 4.0f; break;
+            case '6': wn = 8.0f; break;
+            default: break;
+        }
+    }
+
+    // ============================================================
+    // 7. HELPERS / INITIALIZATION
+    // ============================================================
+
+    void publish_semantic_occupancy_grid()
+    {
+        if (!semantic_occupancy_pub_) {
+            return;
+        }
+
+        nav_msgs::msg::OccupancyGrid msg;
+
+        msg.header.stamp = this->now();
+        msg.header.frame_id = "body_link";
+
+        msg.info.resolution = DS;
+        msg.info.width = JMAX;
+        msg.info.height = IMAX;
+
+        msg.info.origin.position.x = -0.5 * JMAX * DS;
+        msg.info.origin.position.y = -0.5 * IMAX * DS;
+        msg.info.origin.position.z = 0.0;
+
+        msg.info.origin.orientation.x = 0.0;
+        msg.info.origin.orientation.y = 0.0;
+        msg.info.origin.orientation.z = 0.0;
+        msg.info.origin.orientation.w = 1.0;
+
+        msg.data.resize(IMAX * JMAX);
+
+        int occupied_cells = 0;
+
+        for (int n = 0; n < IMAX * JMAX; ++n)
+        {
+            if (semantic_current_grid_[n] > 0)
+            {
+                msg.data[n] = 100;      // Occupied for RViz
+                occupied_cells++;
+            }
+            else
+            {
+                msg.data[n] = 0;        // Free
+            }
+        }
+
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            2000,
+            "Publishing semantic occupancy grid with %d occupied cells.",
+            occupied_cells
+        );
+
+        semantic_occupancy_pub_->publish(msg);
+    }
+
+    float distance_to_nearest_occupied_cell(
+        const std::vector<int8_t>& grid,
+        int i0,
+        int j0
+    ) {
+        float best = 1.0e6f;
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int n = i * JMAX + j;
+
+                if (grid[n] <= 0) {
+                    continue;
+                }
+
+                const float di = static_cast<float>(i - i0);
+                const float dj = static_cast<float>(j - j0);
+                const float d = std::sqrt(di * di + dj * dj) * DS;
+
+                best = std::min(best, d);
+            }
+        }
+
+        return best;
+    }
+
+    float distance_to_nearest_free_cell(
+        const std::vector<int8_t>& grid,
+        int i0,
+        int j0
+    ) {
+        float best = 1.0e6f;
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int n = i * JMAX + j;
+
+                if (grid[n] > 0) {
+                    continue;
+                }
+
+                const float di = static_cast<float>(i - i0);
+                const float dj = static_cast<float>(j - j0);
+                const float d = std::sqrt(di * di + dj * dj) * DS;
+
+                best = std::min(best, d);
+            }
+        }
+
+        return best;
+    }
+
+    void update_interpolated_semantic_grid() {
+        if (!semantic_update_.active) {
+            semantic_current_grid_ = semantic_target_grid_;
+            return;
+        }
+
+        const float lam = std::clamp(semantic_update_.lambda, 0.0f, 1.0f);
+
+        semantic_current_grid_.assign(IMAX * JMAX, 0);
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int n = i * JMAX + j;
+
+                const bool old_occ = semantic_previous_grid_[n] > 0;
+                const bool new_occ = semantic_target_grid_[n] > 0;
+
+                if (old_occ && new_occ) {
+                    semantic_current_grid_[n] = 1;
+                    continue;
+                }
+
+                if (semantic_update_.mode == SemanticUpdateMode::INSERTING_CONSTRAINT) {
+                    if (new_occ) {
+                        float d_old = distance_to_nearest_occupied_cell(
+                            semantic_previous_grid_, i, j
+                        );
+
+                        float d_new_boundary = distance_to_nearest_free_cell(
+                            semantic_target_grid_, i, j
+                        );
+
+                        if (d_old <= lam * (d_old + d_new_boundary + 1.0e-3f)) {
+                            semantic_current_grid_[n] = 1;
+                        }
+                    }
+                }
+
+                if (semantic_update_.mode == SemanticUpdateMode::REMOVING_CONSTRAINT) {
+                    if (old_occ) {
+                        float d_target = distance_to_nearest_occupied_cell(
+                            semantic_target_grid_, i, j
+                        );
+
+                        float d_old_boundary = distance_to_nearest_free_cell(
+                            semantic_previous_grid_, i, j
+                        );
+
+                        if (d_target <= (1.0f - lam) * (d_target + d_old_boundary + 1.0e-3f)) {
+                            semantic_current_grid_[n] = 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void copy_current_globals_into_pending_field() {
+        const int N = IMAX * JMAX * QMAX;
+
+        std::memcpy(pending_field_.hgrid.data(), hgrid1, N * sizeof(float));
+        std::memcpy(pending_field_.dhdt.data(), dhdt_grid, N * sizeof(float));
+        std::memcpy(pending_field_.beta.data(), beta_grid_, N * sizeof(float));
+        std::memcpy(pending_field_.guidance_x.data(), guidance_x_grid, N * sizeof(float));
+        std::memcpy(pending_field_.guidance_y.data(), guidance_y_grid, N * sizeof(float));
+        std::memcpy(pending_field_.bound.data(), bound, N * sizeof(float));
+
+        pending_field_.timestamp = std::chrono::steady_clock::now();
+        pending_field_.valid = true;
+    }
+
+    void start_semantic_insertion() {
+        new_constraint_event_flag_ = true;
+        constraint_event_counter_++;
+
+        semantic_update_.mode = SemanticUpdateMode::INSERTING_CONSTRAINT;
+        semantic_update_.active = true;
+        semantic_previous_grid_ = semantic_current_grid_;
+        semantic_update_.lambda = 0.0f;
+
+        semantic_update_.lambda_dot_min =
+            1.0f / std::max(semantic_update_.max_update_time_sec, 1.0e-3f);
+
+        semantic_update_.commanded_lambda_dot =
+            semantic_update_.lambda_dot_max;
+
+        semantic_update_.lambda_dot =
+            semantic_update_.lambda_dot_min;
+
+        semantic_update_.start_time = std::chrono::steady_clock::now();
+        semantic_update_.last_update_time = semantic_update_.start_time;
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Started semantic constraint insertion"
+        );
+    }
+
+    void start_semantic_removal() {
+        new_constraint_event_flag_ = true;
+        constraint_event_counter_++;
+
+        semantic_update_.mode = SemanticUpdateMode::REMOVING_CONSTRAINT;
+        semantic_update_.active = true;
+        semantic_previous_grid_ = semantic_current_grid_;
+        semantic_update_.lambda = 0.0f;
+
+        semantic_update_.lambda_dot_min =
+            1.0f / std::max(semantic_update_.max_update_time_sec, 1.0e-3f);
+
+        semantic_update_.commanded_lambda_dot =
+            semantic_update_.lambda_dot_max;
+
+        semantic_update_.lambda_dot =
+            semantic_update_.lambda_dot_min;
+
+        semantic_update_.start_time = std::chrono::steady_clock::now();
+        semantic_update_.last_update_time = semantic_update_.start_time;
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Started semantic constraint removal"
+        );
+    }
+
+    void initialize_constraint_reload_timer() {
+
+        if (constraints_path_.empty()) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Runtime constraints reload disabled because constraints_path is empty."
+            );
+            return;
+        }
+
+        const double hz = std::max(0.1, constraints_reload_hz_);
+        const int period_ms = static_cast<int>(1000.0 / hz);
+
+        constraints_reload_callback_group_ =
+            this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+
+        constraints_reload_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(period_ms),
+            [this]() {
+                // RCLCPP_ERROR(
+                //     this->get_logger(),
+                //     "========== SIMPLE TIMER FIRED =========="
+                // );
+
+                this->reload_constraints_callback();
+            },
+            constraints_reload_callback_group_
+        );
+
+        // RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "Runtime constraints reload enabled: %.2f Hz, path=%s, period=%d ms",
+        //     hz,
+        //     constraints_path_.c_str(),
+        //     period_ms
+        // );
+    }
+    
+
+    void reload_constraints_callback() {
+        // RCLCPP_ERROR(
+        //     this->get_logger(),
+        //     "========== RELOAD CALLBACK FIRED =========="
+        // );
+
+        // RCLCPP_INFO_THROTTLE(
+        //     this->get_logger(),
+        //     *this->get_clock(),
+        //     2000,
+        //     "reload_constraints_callback is alive. path=%s",
+        //     constraints_path_.c_str()
+        // );
+        ConstraintManager fresh_manager;
+
+        if (!fresh_manager.load_from_json(constraints_path_)) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                5000,
+                "Failed to reload constraints JSON: %s",
+                constraints_path_.c_str()
+            );
+            return;
+        }
+
+        // RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "[RELOAD] JSON loaded successfully"
+        // );
+
+        const ConstraintRuntimeConfig& fresh_config = fresh_manager.get_config();
+
+        // for (const auto& rc : fresh_config.constraints) {
+        //     RCLCPP_INFO(
+        //         this->get_logger(),
+        //         "[RELOAD] constraint id=%s type=%d enforce=%s buffer=%.3f",
+        //         rc.id.c_str(),
+        //         static_cast<int>(rc.type),
+        //         rc.enforce ? "true" : "false",
+        //         rc.buffer_distance_m
+        //     );
+        // }
+
+        apply_runtime_constraint_config(fresh_config, true);
+
+        constraint_runtime_config_ = fresh_config;
+    }
+
+    void update_semantic_update_state() {
+        if (!semantic_update_.active) {
+            semantic_update_.mode = SemanticUpdateMode::NORMAL;
+            semantic_update_.lambda = 1.0f;
+            semantic_update_.lambda_dot = 0.0f;
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+
+        float dt =
+            std::chrono::duration<float>(
+                now - semantic_update_.last_update_time
+            ).count();
+
+        semantic_update_.last_update_time = now;
+        dt = std::clamp(dt, 0.0f, 0.2f);
+
+        // Fixed insertion/removal schedule for now.
+        semantic_update_.lambda_dot = semantic_update_.lambda_dot_max;
+
+        semantic_update_.lambda += dt * semantic_update_.lambda_dot;
+        semantic_update_.lambda =
+            std::clamp(semantic_update_.lambda, 0.0f, 1.0f);
+
+        if (semantic_update_.lambda >= 0.999f) {
+            semantic_update_.active = false;
+            semantic_update_.lambda = 1.0f;
+            semantic_update_.lambda_dot = 0.0f;
+            semantic_update_.mode = SemanticUpdateMode::NORMAL;
+
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Completed semantic update"
+            );
+        }
+    }
+
+    float get_person_buffer_from_constraints(
+        const ConstraintRuntimeConfig& cfg) const
+    {
+        float person_buffer_m = 0.0f;
+
+        for (const auto& constraint : cfg.constraints) {
+            if (!constraint.enabled ||
+                !constraint.enforce)
+            {
+                continue;
+            }
+
+            bool targets_person = false;
+
+            for (const auto& target :
+                constraint.target_classes)
+            {
+                if (target == "person") {
+                    targets_person = true;
+                    break;
+                }
+            }
+
+            if (!targets_person) {
+                continue;
+            }
+
+            if (constraint.buffer_distance_m <= 0.0f) {
+                continue;
+            }
+
+            person_buffer_m = std::max(
+                person_buffer_m,
+                constraint.buffer_distance_m
+            );
+        }
+
+        return person_buffer_m;
+    }
+
+    void apply_runtime_constraint_config(
+        const ConstraintRuntimeConfig& cfg,
+        bool allow_kernel_rebuild)
+    {
+        const float requested_person_buffer_m =
+            get_person_buffer_from_constraints(cfg);
+
+        const bool person_buffer_changed =
+            std::abs(
+                requested_person_buffer_m -
+                robot_MOS_human
+            ) > 1.0e-4f;
+
+        if (!person_buffer_changed) {
+            return;
+        }
+
+        const float previous_person_buffer_m =
+            robot_MOS_human;
+
+        robot_MOS_human =
+            requested_person_buffer_m;
+
+        if (robot_MOS_human >
+            previous_person_buffer_m)
+        {
+            start_semantic_insertion();
+        } else {
+            start_semantic_removal();
+        }
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Person buffer updated from constraints JSON: "
+            "%.3f m -> %.3f m",
+            previous_person_buffer_m,
+            robot_MOS_human
+        );
+
+        if (allow_kernel_rebuild) {
+            rebuild_human_kernel();
+        }
+    }
+
+    void load_constraints_once_at_startup() {
+        if (constraints_path_.empty()) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "No constraints_path provided. Using launch/default parameters."
+            );
+            return;
+        }
+
+        if (constraint_manager_.load_from_json(constraints_path_)) {
+            constraint_runtime_config_ = constraint_manager_.get_config();
+
+            apply_runtime_constraint_config(
+                constraint_runtime_config_,
+                false
+            );
+        } else {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Failed to load constraints JSON from: %s",
+                constraints_path_.c_str()
+            );
+        }
+    }
+
+
+
+    void initialize_mpc() {
+        mpc3d_controller.set_velocity_bounds(
+            vel_max_x_fwd_,
+            vel_max_x_bwd_,
+            vel_max_y_,
+            vel_max_yaw_
+        );
+
+        mpc3d_controller.setup_QP();
+        mpc3d_controller.solve();
+    }
+
+    void update_robot_state(const nav_msgs::msg::Odometry& data)
+    {
+        dt_state = std::chrono::duration<float>(
+            std::chrono::steady_clock::now() - t_state).count();
+        t_state = std::chrono::steady_clock::now();
+        grid_age += dt_state;
+
+        // Save previous pose
+        float x_prev = x[0];
+        float y_prev = x[1];
+        float yaw_prev = x[2];
+
+        // Update pose
+        x[0] = data.pose.pose.position.x;
+        x[1] = data.pose.pose.position.y;
+
+        const auto& q = data.pose.pose.orientation;
+        const float sin_yaw = 2.0f * (q.w*q.z + q.x*q.y);
+        const float cos_yaw = 1.0f - 2.0f*(q.y*q.y + q.z*q.z);
+        x[2] = std::atan2(sin_yaw, cos_yaw);
+
+        const float dt = std::max(dt_state, 1.0e-3f);
+
+        float dx_world = (x[0] - x_prev) / dt;
+        float dy_world = (x[1] - y_prev) / dt;
+
+        float c = std::cos(x[2]);
+        float s = std::sin(x[2]);
+
+        v_meas_body[0] =  c * dx_world + s * dy_world;
+        v_meas_body[1] = -s * dx_world + c * dy_world;
+
+        float dyaw = x[2] - yaw_prev;
+        while (dyaw > M_PI)  dyaw -= 2.0f * M_PI;
+        while (dyaw < -M_PI) dyaw += 2.0f * M_PI;
+
+        v_meas_body[2] = dyaw / dt;
+    }
+
+    bool update_grid_metadata_from_message(const nav_msgs::msg::OccupancyGrid& msg) {
+        if (msg.data.size() != IMAX * JMAX) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "occupancy_grid size mismatch: got %zu expected %d",
+                msg.data.size(),
+                IMAX * JMAX
+            );
+            return false;
+        }
+    
+        dt_grid = std::chrono::duration<float>(std::chrono::steady_clock::now() - t_grid).count();
+        t_grid = std::chrono::steady_clock::now();
+        grid_age = dt_grid;
+    
+        dx[0] = msg.info.origin.position.x - xc[0];
+        dx[1] = msg.info.origin.position.y - xc[1];
+        xc[0] = msg.info.origin.position.x;
+        xc[1] = msg.info.origin.position.y;
+    
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            conf[n] = msg.data[n];
+        }
+    
+        return true;
+    }
+
+    void startup_robot() {
+        sport_req.RecoveryStand(req);
+        sleep(1);
+        sport_req.SpeedLevel(req, 1);
+        sleep(1);
+    }
+
+    void initialize_robot_kernels() {
+        robot_kernel_obstacle = nullptr;
+        robot_kernel_human = nullptr;
+    
+        robot_kernel_dim_obstacle = initialize_robot_kernel(robot_kernel_obstacle, robot_MOS_obstacle);
+        robot_kernel_dim_human = initialize_robot_kernel(robot_kernel_human, robot_MOS_human);
+    }
+
+    void rebuild_human_kernel()
+    {
+        std::unique_lock<std::shared_mutex> lock(
+            field_mutex_);
+
+        if (robot_kernel_human) {
+            std::free(robot_kernel_human);
+            robot_kernel_human = nullptr;
+        }
+
+        robot_kernel_dim_human =
+            initialize_robot_kernel(
+                robot_kernel_human,
+                robot_MOS_human
+            );
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Rebuilt human kernel from JSON: "
+            "buffer=%.3f m, dimension=%d, resolution=%.3f m",
+            robot_MOS_human,
+            robot_kernel_dim_human,
+            DS
+        );
+    }
+
+    void rebuild_robot_kernels() {
+            std::unique_lock<std::shared_mutex> lock(field_mutex_);
+    
+            if (robot_kernel_human) {
+                std::free(robot_kernel_human);
+                robot_kernel_human = nullptr;
+            }
+    
+            if (robot_kernel_obstacle) {
+                std::free(robot_kernel_obstacle);
+                robot_kernel_obstacle = nullptr;
+            }
+    
+            robot_kernel_dim_human =
+                initialize_robot_kernel(robot_kernel_human, robot_MOS_human);
+    
+            robot_kernel_dim_obstacle =
+                initialize_robot_kernel(robot_kernel_obstacle, robot_MOS_obstacle);
+    
+            // RCLCPP_INFO(
+            //     this->get_logger(),
+            //     "Rebuilt robot kernels from JSON constraints: human=%.2f, obstacle=%.2f",
+            //     robot_MOS_human,
+            //     robot_MOS_obstacle
+            // );
+        }
+
+    void initialize_static_grids() {
+        semantic_occupancy_grid_.assign(IMAX * JMAX, 0);
+        semantic_previous_grid_.assign(IMAX * JMAX, 0);
+        semantic_target_grid_.assign(IMAX * JMAX, 0);
+        semantic_current_grid_.assign(IMAX * JMAX, 0);
+
+        for (std::size_t class_index = 0; class_index < NUM_CANONICAL_SEMANTIC_CLASSES; ++class_index)
+        {
+            semantic_class_layers_[class_index].assign(
+                IMAX * JMAX,
+                0);
+
+            semantic_class_last_seen_[class_index].assign(
+                IMAX * JMAX,
+                0.0f);
+        }
+
+        semantic_model_class_grid_.assign(
+            IMAX * JMAX,
+            0);
+
+        semantic_canonical_class_grid_.assign(
+            IMAX * JMAX,
+            0);
+        
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            occ1[n] = 1.0f;
+            occ0[n] = 1.0f;
+            conf[n] = 0;
+            grid_temp[n] = 0.0f;
+            class_map[n] = 0;
+            visibility_map[n] = 0;
+            class_map_expanded[n] = 0;
+            guidance_x_display[n] = 0.0f;
+            guidance_y_display[n] = 0.0f;
+            bound_display[n] = 0.0f;
+            tangent_layer_display[n] = 0;
+        }
+    }
+
+    void initialize_clocks_and_flags() {
+        gen.seed(rd());
+        current_parameter_deck = sorted_parameter_deck;
+        std::shuffle(current_parameter_deck.begin(), current_parameter_deck.end(), gen);
+    
+        t_start = std::chrono::steady_clock::now();
+        t_grid = std::chrono::steady_clock::now();
+        t_state = std::chrono::steady_clock::now();
+        latest_field_timestamp_ = std::chrono::steady_clock::now();
+        last_logging_publish_time_ = std::chrono::steady_clock::now();
+    }
+
+    void initialize_logging_outputs() {
+        if (!enable_data_logging_to_file_) {
+            RCLCPP_INFO(this->get_logger(), "Data logging DISABLED");
+            return;
+        }
+    
+        std::string baseFileName = "experiment_data";
+        std::string dateTime = getCurrentDateTime();
+    
+        std::string fileNameCSV = baseFileName + "_" + dateTime + ".csv";
+        outFileCSV.open(fileNameCSV);
+        if (!outFileCSV.is_open()) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to open CSV log file: %s", fileNameCSV.c_str());
+            throw std::runtime_error("Failed to open CSV log file");
+        }
+    
+        const std::vector<std::string> header = {
+            "t_ms", "space_counter",
+            "rx", "ry", "yaw",
+            "vx_rt", "vy_rt", "wz_rt",
+            "vx_mpc", "vy_mpc", "wz_mpc",
+            "vx_meas", "vy_meas", "wz_meas",
+            "vx_mpc_err", "vy_mpc_err", "wz_mpc_err",
+            "h", "dhdx", "dhdy", "dhdq", "dhdt",
+            "alpha", "on_off",
+            "lambda", "lambda_dot", "insertion_active",
+            "new_constraint_event", "constraint_event_counter"
+        };
+    
+        for (size_t n = 0; n < header.size(); ++n) {
+            outFileCSV << header[n];
+            if (n + 1 < header.size()) outFileCSV << ",";
+        }
+        outFileCSV << std::endl;
+    
+        std::string fileNameBIN = baseFileName + "_" + dateTime + ".bin";
+        outFileBIN.open(fileNameBIN, std::ios::binary | std::ios::app);
+        if (!outFileBIN.is_open()) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to open BIN log file: %s", fileNameBIN.c_str());
+            throw std::runtime_error("Failed to open BIN log file");
+        }
+    
+        RCLCPP_INFO(this->get_logger(), "Data logging ENABLED: %s", fileNameCSV.c_str());
+    }
+    
+    void declare_and_load_parameters() {
+        // ------------------------------------------------------------
+        // Logging / visualization
+        // ------------------------------------------------------------
+        this->declare_parameter("enable_data_logging_to_file", true);
+        this->declare_parameter("enable_display", true);
+        this->declare_parameter("logging_publish_hz", 10.0);
+        this->declare_parameter("constraints_path", "");
+        this->declare_parameter("enable_human_persistence", true);
+        this->declare_parameter("human_persistence_decay", 0.96);
+        this->declare_parameter("human_persistence_threshold", 0.25);
+        this->declare_parameter("human_persistence_observation_value", 1.0);
+        this->declare_parameter("constraints_reload_hz", 0.1);
+        this->declare_parameter("enable_oak_semantic_observations", true);
+        this->declare_parameter("enable_legacy_yolo_semantics", false);
+        this->declare_parameter("semantic_observation_topic","/semantic_volume/occupied_voxels");
+        this->declare_parameter("semantic_observation_frame","body_link");
+        this->declare_parameter("semantic_observation_timeout_sec",1.0);
+        this->declare_parameter("semantic_observation_min_z",-0.50);
+        this->declare_parameter("semantic_observation_max_z",1.50);
+        this->declare_parameter<std::vector<std::string>>("active_semantic_classes",std::vector<std::string>{"person"});
+    
+        enable_data_logging_to_file_ = this->get_parameter("enable_data_logging_to_file").as_bool();
+        enable_display = this->get_parameter("enable_display").as_bool();
+        logging_publish_hz_ = this->get_parameter("logging_publish_hz").as_double();
+        logging_publish_period_ = (logging_publish_hz_ > 0.0) ? (1.0 / logging_publish_hz_) : 0.0;
+        constraints_path_ = this->get_parameter("constraints_path").as_string();
+        constraints_reload_hz_ = this->get_parameter("constraints_reload_hz").as_double();
+        enable_human_persistence_ = this->get_parameter("enable_human_persistence").as_bool();
+        human_persistence_decay_ = static_cast<float>(this->get_parameter("human_persistence_decay").as_double());
+        human_persistence_threshold_ = static_cast<float>(this->get_parameter("human_persistence_threshold").as_double());
+        human_persistence_observation_value_ = static_cast<float>(this->get_parameter("human_persistence_observation_value").as_double());
+        enable_oak_semantic_observations_ = this->get_parameter("enable_oak_semantic_observations").as_bool();
+        enable_legacy_yolo_semantics_ = this->get_parameter("enable_legacy_yolo_semantics").as_bool();
+        semantic_observation_topic_ = this->get_parameter("semantic_observation_topic").as_string();
+        semantic_observation_frame_ = this->get_parameter("semantic_observation_frame").as_string();
+        semantic_observation_timeout_sec_ = static_cast<float>(this->get_parameter("semantic_observation_timeout_sec").as_double());
+        semantic_observation_min_z_ = static_cast<float>(this->get_parameter("semantic_observation_min_z").as_double());
+        semantic_observation_max_z_ = static_cast<float>(this->get_parameter("semantic_observation_max_z").as_double());
+        
+        active_semantic_classes_.clear();
+
+        const auto active_class_names =
+            this->get_parameter(
+                "active_semantic_classes").as_string_array();
+
+        for (const auto& class_name : active_class_names) {
+            const SemanticClass semantic_class =
+                semantic_class_from_name(
+                    class_name);
+
+            if (semantic_class ==
+                SemanticClass::Unknown)
+            {
+                RCLCPP_WARN(
+                    this->get_logger(),
+                    "Unknown active semantic class '%s'.",
+                    class_name.c_str());
+
+                continue;
+            }
+
+            active_semantic_classes_.insert(
+                semantic_class);
+
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Activated semantic occupancy class: %s",
+                semantic_class_name(
+                    semantic_class));
+        }
+
+        initialize_logging_outputs();
+    
+        // ------------------------------------------------------------
+        // Safety-field / semantic parameters
+        // ------------------------------------------------------------
+        this->declare_parameter("dh0_human", 1.0);
+        this->declare_parameter("dh0_obstacle", 0.3);
+    
+        this->declare_parameter("enable_social_navigation", false);
+        this->declare_parameter("social_tangent_bias", 0.5);
+        this->declare_parameter("social_tangent_layers", 3);
+        this->declare_parameter("social_layer_thickness", 1);
+        this->declare_parameter("human_direction_threshold", 0.15);
+    
+        this->declare_parameter("robot_mos_human", 0.01);
+        this->declare_parameter("robot_mos_obstacle", 0.01);
+    
+        dh0_human = this->get_parameter("dh0_human").as_double();
+        dh0_obstacle = this->get_parameter("dh0_obstacle").as_double();
+    
+        enable_social_navigation_ = this->get_parameter("enable_social_navigation").as_bool();
+        social_tangent_bias_ = this->get_parameter("social_tangent_bias").as_double();
+        social_tangent_layers_ = this->get_parameter("social_tangent_layers").as_int();
+        social_layer_thickness_ = this->get_parameter("social_layer_thickness").as_int();
+        human_direction_threshold_ = this->get_parameter("human_direction_threshold").as_double();
+    
+        robot_MOS_human = this->get_parameter("robot_mos_human").as_double();
+        robot_MOS_obstacle = this->get_parameter("robot_mos_obstacle").as_double();
+    
+        // ------------------------------------------------------------
+        // Dynamic CBF parameters
+        // ------------------------------------------------------------
+        this->declare_parameter("cbf_sigma_epsilon", 0.1);
+        this->declare_parameter("cbf_sigma_kappa", 5.0);
+    
+        cbf_sigma_epsilon_ = this->get_parameter("cbf_sigma_epsilon").as_double();
+        cbf_sigma_kappa_ = this->get_parameter("cbf_sigma_kappa").as_double();
+    
+        // ------------------------------------------------------------
+        // Velocity bounds
+        // ------------------------------------------------------------
+        this->declare_parameter("vel_max_x_fwd", 0.9);
+        this->declare_parameter("vel_max_x_bwd", 0.9);
+        this->declare_parameter("vel_max_y", 0.9);
+        this->declare_parameter("vel_max_yaw", 0.8);
+    
+        vel_max_x_fwd_ = this->get_parameter("vel_max_x_fwd").as_double();
+        vel_max_x_bwd_ = this->get_parameter("vel_max_x_bwd").as_double();
+        vel_max_y_ = this->get_parameter("vel_max_y").as_double();
+        vel_max_yaw_ = this->get_parameter("vel_max_yaw").as_double();
+    
+        // ------------------------------------------------------------
+        // Human tracker parameters
+        // ------------------------------------------------------------
+        this->declare_parameter("human_track_timeout_sec", 10.0);
+        this->declare_parameter("human_track_gate_radius", 0.8);
+        this->declare_parameter("human_track_velocity_decay_tau", 1.0);
+        this->declare_parameter("human_track_velocity_threshold", 0.1);
+        this->declare_parameter("min_yolo_cells", 5);
+        this->declare_parameter("enable_human_tracker_dilation", true);
+        this->declare_parameter("decay_in_fov", 0.7);
+        this->declare_parameter("decay_stationary", 0.95);
+        this->declare_parameter("decay_unconfirmed", 0.85);
+        this->declare_parameter("no_retrack_on_move", true);
+    
+        const float track_timeout = this->get_parameter("human_track_timeout_sec").as_double();
+        const float track_gate = this->get_parameter("human_track_gate_radius").as_double();
+        const float track_decay = this->get_parameter("human_track_velocity_decay_tau").as_double();
+        const float track_velocity_threshold = this->get_parameter("human_track_velocity_threshold").as_double();
+        const float decay_in_fov = this->get_parameter("decay_in_fov").as_double();
+        const float decay_stationary = this->get_parameter("decay_stationary").as_double();
+        const float decay_unconfirmed = this->get_parameter("decay_unconfirmed").as_double();
+        const bool no_retrack_on_move = this->get_parameter("no_retrack_on_move").as_bool();
+    
+        min_yolo_cells_ = this->get_parameter("min_yolo_cells").as_int();
+        enable_human_tracker_dilation_ = this->get_parameter("enable_human_tracker_dilation").as_bool();
+    
+        human_tracker_ = std::make_unique<HumanTracker>(
+            track_timeout,
+            track_gate,
+            track_decay,
+            track_velocity_threshold,
+            decay_in_fov,
+            decay_stationary,
+            decay_unconfirmed,
+            3,
+            3,
+            no_retrack_on_move
+        );
+    
+        // ------------------------------------------------------------
+        // Tight-area wall softening
+        // ------------------------------------------------------------
+        this->declare_parameter("tight_area_human_threshold", 2.0);
+        this->declare_parameter("tight_area_h_threshold", 0.3);
+        this->declare_parameter("tight_area_wall_slack", -0.1);
+    
+        tight_area_human_threshold_ = this->get_parameter("tight_area_human_threshold").as_double();
+        tight_area_h_threshold_ = this->get_parameter("tight_area_h_threshold").as_double();
+        tight_area_wall_slack_ = this->get_parameter("tight_area_wall_slack").as_double();
+    
+        // ------------------------------------------------------------
+        // CloudMerger params passed from this node in main()
+        // ------------------------------------------------------------
+        this->declare_parameter("min_z", 0.05);
+        this->declare_parameter("max_z", 0.80);
+    
+        // ------------------------------------------------------------
+        // Informational prints
+        // ------------------------------------------------------------
+        // RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "dh0_human=%.2f, dh0_obstacle=%.2f, MOS_human=%.2f, MOS_obstacle=%.2f, display=%s, social_nav=%s",
+        //     dh0_human, dh0_obstacle, robot_MOS_human, robot_MOS_obstacle,
+        //     enable_display ? "true" : "false",
+        //     enable_social_navigation_ ? "true" : "false"
+        // );
+    
+        // RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "Dynamic CBF: sigma_epsilon=%.3f, sigma_kappa=%.2f",
+        //     cbf_sigma_epsilon_, cbf_sigma_kappa_
+        // );
+    
+        // RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "Velocity bounds: x_fwd=%.2f, x_bwd=%.2f, y=%.2f, yaw=%.2f",
+        //     vel_max_x_fwd_, vel_max_x_bwd_, vel_max_y_, vel_max_yaw_
+        // );
+    
+        // RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "HumanTracker: timeout=%.1fs, gate=%.2fm, vel_thresh=%.2fm/s, decay_fov=%.2f, decay_stat=%.2f, decay_unconf=%.2f, no_retrack=%s",
+        //     track_timeout, track_gate, track_velocity_threshold,
+        //     decay_in_fov, decay_stationary, decay_unconfirmed,
+        //     no_retrack_on_move ? "true" : "false"
+        // );
+    
+        // RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "Tight-area params: human_thresh=%.2fm, h_thresh=%.2f, wall_slack=%.2f",
+        //     tight_area_human_threshold_, tight_area_h_threshold_, tight_area_wall_slack_
+        // );
+    
+        RCLCPP_INFO(this->get_logger(), "Logging publish rate: %.1f Hz", logging_publish_hz_);
+    }
+    
+    void allocate_persistent_buffers() {
+        cudaError_t err;
+    
+        // ------------------------------------------------------------
+        // Main persistent field buffers
+        // ------------------------------------------------------------
+        err = cudaMallocHost((void**)&hgrid1, IMAX * JMAX * QMAX * sizeof(float));
+        if (err != cudaSuccess) {
+            RCLCPP_ERROR(this->get_logger(), "CUDA allocation failed for hgrid1: %s", cudaGetErrorString(err));
+            throw std::runtime_error("CUDA allocation failed for hgrid1");
+        }
+    
+        err = cudaMallocHost((void**)&hgrid0, IMAX * JMAX * QMAX * sizeof(float));
+        if (err != cudaSuccess) {
+            RCLCPP_ERROR(this->get_logger(), "CUDA allocation failed for hgrid0: %s", cudaGetErrorString(err));
+            throw std::runtime_error("CUDA allocation failed for hgrid0");
+        }
+    
+        err = cudaMallocHost((void**)&bound, IMAX * JMAX * QMAX * sizeof(float));
+        if (err != cudaSuccess) {
+            RCLCPP_ERROR(this->get_logger(), "CUDA allocation failed for bound: %s", cudaGetErrorString(err));
+            throw std::runtime_error("CUDA allocation failed for bound");
+        }
+    
+        err = cudaMallocHost((void**)&force, IMAX * JMAX * QMAX * sizeof(float));
+        if (err != cudaSuccess) {
+            RCLCPP_ERROR(this->get_logger(), "CUDA allocation failed for force: %s", cudaGetErrorString(err));
+            throw std::runtime_error("CUDA allocation failed for force");
+        }
+    
+        dhdt_grid = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+        guidance_x_grid = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+        guidance_y_grid = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+        persistent_human_confidence_.assign(IMAX * JMAX, 0.0f);
+        persistent_human_mask_.assign(IMAX * JMAX, 0);
+        hgrid_insertion_old_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+        hgrid_active_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+        dhdt_active_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+        beta_grid_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+
+        const int N_field = IMAX * JMAX * QMAX;
+
+        auto resize_field_buffer = [N_field](FieldBuffer& fb) {
+            fb.hgrid.resize(N_field, 1.0f);
+            fb.dhdt.resize(N_field, 0.0f);
+            fb.beta.resize(N_field, 0.0f);
+            fb.guidance_x.resize(N_field, 0.0f);
+            fb.guidance_y.resize(N_field, 0.0f);
+            fb.bound.resize(N_field, 1.0f);
+            fb.timestamp = std::chrono::steady_clock::now();
+            fb.valid = false;
+        };
+
+        resize_field_buffer(active_field_);
+        resize_field_buffer(pending_field_);
+        if (!hgrid_insertion_old_ || !hgrid_active_ || !dhdt_active_ || !beta_grid_) {
+            RCLCPP_ERROR(this->get_logger(), "Memory allocation failed for field insertion buffers");
+            throw std::runtime_error("Field insertion buffer allocation failed");
+        }
+    
+        if (!dhdt_grid || !guidance_x_grid || !guidance_y_grid) {
+            RCLCPP_ERROR(this->get_logger(), "Memory allocation failed for persistent guidance/dhdt grids");
+            throw std::runtime_error("Persistent grid allocation failed");
+        }
+    
+        // ------------------------------------------------------------
+        // Persistent temporary buffers for profiling-ready execution
+        // ------------------------------------------------------------
+        hgrid_temp_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+        guidance_x_temp_ = static_cast<float*>(std::calloc(IMAX * JMAX * QMAX, sizeof(float)));
+        guidance_y_temp_ = static_cast<float*>(std::calloc(IMAX * JMAX * QMAX, sizeof(float)));
+        forcing_zero_temp_ = static_cast<float*>(std::calloc(IMAX * JMAX * QMAX, sizeof(float)));
+        bound_guidance_temp_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+        class_map_temp_expanded_ = static_cast<int8_t*>(std::malloc(IMAX * JMAX * sizeof(int8_t)));
+        boundary_temp_ = static_cast<float*>(std::malloc(IMAX * JMAX * sizeof(float)));
+        inflate_bound_temp_ = static_cast<float*>(std::malloc(IMAX * JMAX * sizeof(float)));
+        inflate_class_temp_ = static_cast<int8_t*>(std::malloc(IMAX * JMAX * sizeof(int8_t)));
+    
+        if (!hgrid_temp_ || !guidance_x_temp_ || !guidance_y_temp_ ||
+            !forcing_zero_temp_ || !bound_guidance_temp_ ||
+            !class_map_temp_expanded_ || !boundary_temp_ ||
+            !inflate_bound_temp_ || !inflate_class_temp_) {
+            RCLCPP_ERROR(this->get_logger(), "Memory allocation failed for persistent temporary buffers");
+            throw std::runtime_error("Temporary buffer allocation failed");
+        }
+        
+        std::memset(bound_guidance_temp_, 0, IMAX * JMAX * QMAX * sizeof(float));
+    
+        // ------------------------------------------------------------
+        // Initialize values
+        // ------------------------------------------------------------
+        for (int n = 0; n < IMAX * JMAX * QMAX; ++n) {
+            hgrid1[n] = h0;
+            hgrid0[n] = h0;
+            hgrid_temp_[n] = h0;
+            bound[n] = 0.0f;
+            force[n] = 0.0f;
+            dhdt_grid[n] = 0.0f;
+            guidance_x_grid[n] = 0.0f;
+            guidance_y_grid[n] = 0.0f;
+            hgrid_insertion_old_[n] = h0;
+            hgrid_active_[n] = h0;
+            dhdt_active_[n] = 0.0f;
+            beta_grid_[n] = 0.0f;
+        }
+    
+        Kernel::poissonInit();
+    }
+    
+    void initialize_ros_interfaces() {
+        rclcpp::SubscriptionOptions options_occ;
+        rclcpp::SubscriptionOptions options_state;
+        rclcpp::SubscriptionOptions options_cmd;
+        rclcpp::SubscriptionOptions options_yolo;
+        rclcpp::SubscriptionOptions options_semantic_observation;
+    
+        options_occ.callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        options_state.callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        options_cmd.callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        options_yolo.callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        options_semantic_observation.callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
+        image_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
+            this, "/yolo/segmentation_mask"
+        );
+      
+        cloud_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>>(
+            this, "/camera/point_cloud/cloud_registered"
+        );
+
+        semantic_occupancy_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("semantic_occupancy_grid",1);
+        semantic_observation_suber_ =
+            this->create_subscription<
+                sensor_msgs::msg::PointCloud2>(
+                semantic_observation_topic_,
+                rclcpp::SensorDataQoS().keep_last(1),
+                std::bind(
+                    &PoissonControllerNode::
+                        semantic_observation_callback,
+                    this,
+                    std::placeholders::_1),
+                options_semantic_observation
+            );
+       
+        occ_grid_suber_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
+            "occupancy_grid", 1,
+            std::bind(&PoissonControllerNode::occ_grid_callback, this, std::placeholders::_1),
+            options_occ
+        );
+    
+        class_map_suber_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
+            "class_map", 1,
+            std::bind(&PoissonControllerNode::class_map_callback, this, std::placeholders::_1),
+            options_yolo
+        );
+    
+        visibility_map_suber_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
+            "visibility_map", 1,
+            std::bind(&PoissonControllerNode::visibility_map_callback, this, std::placeholders::_1),
+            options_yolo
+        );
+    
+        pose_suber_ = this->create_subscription<nav_msgs::msg::Odometry>(
+            "/odom", 1,
+            std::bind(&PoissonControllerNode::state_update_callback, this, std::placeholders::_1),
+            options_state
+        );
+    
+        twist_suber_ = this->create_subscription<geometry_msgs::msg::Twist>(
+            "u_des", 1,
+            std::bind(&PoissonControllerNode::teleop_callback, this, std::placeholders::_1),
+            options_cmd
+        );
+    
+        key_suber_ = this->create_subscription<std_msgs::msg::Int32>(
+            "key_press", 1,
+            std::bind(&PoissonControllerNode::keyboard_callback, this, std::placeholders::_1),
+            options_cmd
+        );
+    
+        poisson_image_pub_ = this->create_publisher<sensor_msgs::msg::Image>("/poisson/visualization", 10);
+        logging_data_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/poisson/logging_data", 10);
+        profiling_data_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/poisson/profiling_data", 10);
+        relational_debug_grid_.resize(IMAX * JMAX, 0);
+        relational_debug_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/relational_debug_map",10);
+        mpc_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+        mpc_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(10),
+            std::bind(&PoissonControllerNode::mpc_callback, this),
+            mpc_callback_group_
+        );
+    }
+
+    void publish_logging_data() {
+        if (!logging_data_pub_) return;
+
+        std_msgs::msg::Float32MultiArray msg;
+        msg.data = {
+            t_ms,
+            static_cast<float>(space_counter),
+
+            x[0], x[1], x[2],
+
+            v[0], v[1], v[2],
+            vt[0], vt[1], vt[2],
+
+            h, dhdx, dhdy, dhdq, dhdt,
+            wn,
+            static_cast<float>(realtime_sf_flag | predictive_sf_flag),
+
+            semantic_update_.lambda,
+            semantic_update_.lambda_dot,
+            static_cast<float>(semantic_update_.active),
+            new_constraint_event_flag_ ? 1.0f : 0.0f,
+            static_cast<float>(constraint_event_counter_)
+        };
+
+        logging_data_pub_->publish(msg);
+
+        new_constraint_event_flag_ = false;
+    }
+
+    void update_persistent_human_memory_from_expanded_map() {
+        if (!enable_human_persistence_) {
+            std::fill(
+                persistent_human_confidence_.begin(),
+                persistent_human_confidence_.end(),
+                0.0f
+            );
+    
+            std::fill(
+                persistent_human_mask_.begin(),
+                persistent_human_mask_.end(),
+                0
+            );
+    
+            return;
+        }
+    
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            if (class_map_expanded[n] == 1) {
+                persistent_human_confidence_[n] =
+                    human_persistence_observation_value_;
+            } else {
+                persistent_human_confidence_[n] *= human_persistence_decay_;
+            }
+    
+            persistent_human_mask_[n] =
+                persistent_human_confidence_[n] >= human_persistence_threshold_
+                    ? 1
+                    : 0;
+        }
+    }
+    
+    void inject_persistent_humans_into_expanded_map() {
+        if (!enable_human_persistence_) {
+            return;
+        }
+    
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            if (persistent_human_mask_[n]) {
+                class_map_expanded[n] = 1;
+            }
+        }
+    }
+
+
+
+
+
+    // ============================================================
+    // 8. EXISTING LOW-LEVEL METHODS TO KEEP / MOVE VERBATIM
+    // ============================================================
+
+    void build_occ_map(float* occ_map, const float* occ_map_old, const int8_t* conf) {
+        const int8_t T_hi = 85;
+        const int8_t T_lo = 64;
+    
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int i0 = i + static_cast<int>(std::round(dx[1] / DS));
+                const int j0 = j + static_cast<int>(std::round(dx[0] / DS));
+    
+                const bool in_grid = (i0 >= 0) && (i0 < IMAX) && (j0 >= 0) && (j0 < JMAX);
+                const bool strong = conf[i * JMAX + j] >= T_hi;
+                const bool weak = conf[i * JMAX + j] >= T_lo;
+    
+                if (strong) {
+                    occ_map[i * JMAX + j] = -1.0f;
+                } else if (weak && in_grid) {
+                    occ_map[i * JMAX + j] = occ_map_old[i0 * JMAX + j0];
+                } else {
+                    occ_map[i * JMAX + j] = 1.0f;
+                }
+            }
+        }
+    }
+
+    void find_boundary(float* grid, float* bound, bool fix_flag, bool tight_area, const int8_t* class_map) {
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                if (i == 0 || i == IMAX - 1 || j == 0 || j == JMAX - 1) {
+                    bound[i * JMAX + j] = 0.0f;
+                }
+            }
+        }
+    
+        std::memcpy(boundary_temp_, bound, IMAX * JMAX * sizeof(float));
+        float* b0 = boundary_temp_;
+    
+        for (int i = 1; i < IMAX - 1; ++i) {
+            for (int j = 1; j < JMAX - 1; ++j) {
+                const int n = i * JMAX + j;
+    
+                if (b0[n] == 1.0f) {
+                    if (b0[(i + 1) * JMAX + j] == -1.0f ||
+                        b0[(i - 1) * JMAX + j] == -1.0f ||
+                        b0[i * JMAX + (j + 1)] == -1.0f ||
+                        b0[i * JMAX + (j - 1)] == -1.0f ||
+                        b0[(i + 1) * JMAX + (j + 1)] == -1.0f ||
+                        b0[(i - 1) * JMAX + (j + 1)] == -1.0f ||
+                        b0[(i + 1) * JMAX + (j - 1)] == -1.0f ||
+                        b0[(i - 1) * JMAX + (j - 1)] == -1.0f) {
+                        bound[n] = 0.0f;
+                    }
+                }
+    
+                if (fix_flag && !bound[n]) {
+                    bool is_wall = true;
+                    if (class_map) {
+                        is_wall = (class_map[n] != 1);
+                    }
+    
+                    if (tight_area && is_wall) {
+                        grid[n] = h0 + tight_area_wall_slack_;
+                    } else {
+                        grid[n] = h0;
+                    }
+                }
+            }
+        }
+    }
+
+    int initialize_robot_kernel(
+        float*& kernel,
+        float buffer_m)
+    {
+        robot_length = 0.7f;
+        robot_width = 0.3f;
+
+        buffer_m = std::max(buffer_m, 0.0f);
+        // const float ar =
+        //     robot_length / 2.0f + buffer_m;
+        // const float br =
+        //     robot_width / 2.0f + buffer_m;
+
+        const float ar = buffer_m * robot_length / 2.0f;
+        const float br = buffer_m * robot_width / 2.0f;
+
+        const float half_extent_m =
+            std::sqrt(ar * ar + br * br);
+
+
+        int dim =
+            2 * static_cast<int>(
+                std::ceil(half_extent_m / DS)
+            ) + 1;
+        dim = std::max(dim, 3);
+        if ((dim % 2) == 0) {
+            ++dim;
+        }
+        kernel = static_cast<float*>(
+            std::malloc(
+                dim * dim * QMAX * sizeof(float)
+            )
+        );
+        if (!kernel) {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "Failed to allocate robot kernel"
+            );
+
+            throw std::runtime_error(
+                "Robot kernel allocation failed"
+            );
+        }
+
+        std::memset(
+            kernel,
+            0,
+            dim * dim * QMAX * sizeof(float)
+        );
+
+        for (int q = 0; q < QMAX; ++q) {
+            float* kernel_slice =
+                kernel + q * dim * dim;
+
+            const float yawq =
+                q_to_yaw(q, xc[2]);
+
+            fill_elliptical_robot_kernel(
+                kernel_slice,
+                yawq,
+                dim,
+                2.0f,       // ellipse exponent, not buffer distance
+                buffer_m    // value read from JSON
+            );
+        }
+
+        return dim;
+    }
+
+
+    void fill_elliptical_robot_kernel(float* kernel, float yawq, int dim, float expo, float buffer_m) {
+        // Inflate the robot footprint by the requested clearance distance.
+        buffer_m = std::max(buffer_m, 0.0f);
+        const float ar =
+            robot_length / 2.0f + buffer_m;
+        const float br =
+            robot_width / 2.0f + buffer_m;
+    
+        if (ar < 0.001f || br < 0.001f) {
+            for (int i = 0; i < dim * dim; ++i) kernel[i] = 0.0f;
+            return;
+        }
+    
+        for (int i = 0; i < dim; ++i) {
+            const float yi = static_cast<float>(i - dim / 2) * DS;
+            for (int j = 0; j < dim; ++j) {
+                kernel[i * dim + j] = 0.0f;
+                const float xi = static_cast<float>(j - dim / 2) * DS;
+    
+                const float xb = std::cos(yawq) * xi + std::sin(yawq) * yi;
+                const float yb = -std::sin(yawq) * xi + std::cos(yawq) * yi;
+    
+                const float dist =
+                    std::pow(std::abs(xb / ar), expo) +
+                    std::pow(std::abs(yb / br), expo);
+    
+                if (dist <= 1.0f) kernel[i * dim + j] = -1.0f;
+            }
+        }
+    }
+
+
+    void inflate_occupancy_grid(float* bound, int8_t* class_map) {
+        std::memcpy(inflate_bound_temp_, bound, IMAX * JMAX * sizeof(float));
+        float* b0 = inflate_bound_temp_;
+        
+        int8_t* c0 = inflate_class_temp_;
+        if (class_map) {
+            std::memcpy(c0, class_map, IMAX * JMAX * sizeof(int8_t));
+        }
+    
+        for (int i = 1; i < IMAX - 1; ++i) {
+            for (int j = 1; j < JMAX - 1; ++j) {
+                if (!b0[i * JMAX + j]) {
+                    int8_t source_class = 0;
+    
+                    if (class_map) {
+                        for (int di = -1; di <= 1 && source_class == 0; ++di) {
+                            for (int dj = -1; dj <= 1 && source_class == 0; ++dj) {
+                                const int ni = i + di;
+                                const int nj = j + dj;
+                                if (ni >= 0 && ni < IMAX && nj >= 0 && nj < JMAX) {
+                                    if (b0[ni * JMAX + nj] < 0.0f && c0[ni * JMAX + nj] == 1) {
+                                        source_class = 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+    
+                    const float* kernel = (source_class == 1) ? robot_kernel_human : robot_kernel_obstacle;
+                    const int kernel_dim = (source_class == 1) ? robot_kernel_dim_human : robot_kernel_dim_obstacle;
+                    const int lim = (kernel_dim - 1) / 2;
+    
+                    const int ilow = std::max(i - lim, 0);
+                    const int itop = std::min(i + lim, IMAX);
+                    const int jlow = std::max(j - lim, 0);
+                    const int jtop = std::min(j + lim, JMAX);
+    
+                    for (int p = ilow; p < itop; ++p) {
+                        for (int q = jlow; q < jtop; ++q) {
+                            const float kernel_val = kernel[(p - i + lim) * kernel_dim + (q - j + lim)];
+                            bound[p * JMAX + q] += kernel_val;
+    
+                            if (class_map && kernel_val < 0.0f && source_class == 1) {
+                                class_map[p * JMAX + q] = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            if (bound[n] < -1.0f) bound[n] = -1.0f;
+        }
+    }
+
+    bool is_tight_area() {
+        auto tracks = human_tracker_->get_active_tracks();
+        if (tracks.empty()) return false;
+    
+        float min_human_dist = FLT_MAX;
+        for (const auto& track : tracks) {
+            const float d = std::sqrt(std::pow(track.x - x[0], 2) + std::pow(track.y - x[1], 2));
+            min_human_dist = std::min(min_human_dist, d);
+        }
+    
+        const float ic = y_to_i(0.0f, xc[1]);
+        const float jc = x_to_j(0.0f, xc[0]);
+        const float qc = yaw_to_q(x[2], xc[2]);
+    
+        const float ic_clamped = std::clamp(ic, 0.0f, static_cast<float>(IMAX - 1));
+        const float jc_clamped = std::clamp(jc, 0.0f, static_cast<float>(JMAX - 1));
+    
+        const float h_at_robot = trilinear_interpolation(hgrid1, ic_clamped, jc_clamped, qc);
+    
+        const bool tight =
+            (min_human_dist < tight_area_human_threshold_) &&
+            (h_at_robot < tight_area_h_threshold_);
+    
+        return tight;
+    }
+
+    void compute_boundary_gradients(float* guidance_x, float* guidance_y, float* bound,
+                                    const int8_t* class_map,
+                                    float /*rx*/, float /*ry*/,
+                                    float /*vn_x*/, float /*vn_y*/,
+                                    bool populate_human_info) {
+        // Set border gradients
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                if (i == 0) guidance_x[i * JMAX + j] = dh0;
+                if (j == 0) guidance_y[i * JMAX + j] = dh0;
+                if (i == (IMAX - 1)) guidance_x[i * JMAX + j] = -dh0;
+                if (j == (JMAX - 1)) guidance_y[i * JMAX + j] = -dh0;
+            }
+        }
+    
+        if (populate_human_info) {
+            human_boundary_info_.clear();
+        }
+    
+        // Compute raw boundary normals on Layer 0
+        for (int i = 1; i < IMAX - 1; ++i) {
+            for (int j = 1; j < JMAX - 1; ++j) {
+                if (!bound[i * JMAX + j]) {
+                    guidance_x[i * JMAX + j] = 0.0f;
+                    guidance_y[i * JMAX + j] = 0.0f;
+    
+                    for (int p = -1; p <= 1; ++p) {
+                        for (int q = -1; q <= 1; ++q) {
+                            if (q > 0) {
+                                guidance_x[i * JMAX + j] += bound[(i + q) * JMAX + (j + p)];
+                                guidance_y[i * JMAX + j] += bound[(i + p) * JMAX + (j + q)];
+                            } else if (q < 0) {
+                                guidance_x[i * JMAX + j] -= bound[(i + q) * JMAX + (j + p)];
+                                guidance_y[i * JMAX + j] -= bound[(i + p) * JMAX + (j + q)];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    
+        // Normalize and assign class-dependent strength
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                if (!bound[i * JMAX + j]) {
+                    const float V = std::sqrt(
+                        guidance_x[i * JMAX + j] * guidance_x[i * JMAX + j] +
+                        guidance_y[i * JMAX + j] * guidance_y[i * JMAX + j]);
+    
+                    if (V != 0.0f) {
+                        guidance_x[i * JMAX + j] /= V;
+                        guidance_y[i * JMAX + j] /= V;
+                    }
+    
+                    float local_dh0 = dh0_obstacle;
+                    bool is_human = false;
+    
+                    if (class_map) {
+                        for (int di = -1; di <= 1 && !is_human; ++di) {
+                            for (int dj = -1; dj <= 1 && !is_human; ++dj) {
+                                const int ni = i + di;
+                                const int nj = j + dj;
+                                if (ni >= 0 && ni < IMAX && nj >= 0 && nj < JMAX) {
+                                    if (bound[ni * JMAX + nj] < 0.0f && class_map[ni * JMAX + nj] == 1) {
+                                        is_human = true;
+                                    }
+                                }
+                            }
+                        }
+    
+                        if (is_human) {
+                            local_dh0 = dh0_human;
+                            if (populate_human_info) {
+                                human_boundary_info_.emplace_back(
+                                    i, j,
+                                    guidance_x[i * JMAX + j],
+                                    guidance_y[i * JMAX + j],
+                                    local_dh0
+                                );
+                            }
+                        }
+                    }
+    
+                    guidance_x[i * JMAX + j] *= local_dh0;
+                    guidance_y[i * JMAX + j] *= local_dh0;
+                }
+            }
+        }
+    }
+
+    float compute_tangent_direction(const std::vector<HumanTrack>& active_tracks,
+                                    float /*rx*/, float /*ry*/,
+                                    float /*vn_x*/, float /*vn_y*/) {
+        float target_sign = -1.0f;  // Default visual CW / pass left
+    
+        for (const auto& track : active_tracks) {
+            const float current_distance = std::sqrt(track.x * track.x + track.y * track.y);
+    
+            const float current_time =
+                std::chrono::duration<float>(std::chrono::steady_clock::now() - t_start).count();
+    
+            float closing_rate = 0.0f;
+    
+            auto it = prev_human_distances_.find(track.id);
+            if (it != prev_human_distances_.end()) {
+                const float prev_distance = it->second.first;
+                const float prev_time = it->second.second;
+                const float dt = current_time - prev_time;
+    
+                if (dt > 0.01f && dt < 1.0f) {
+                    closing_rate = (prev_distance - current_distance) / dt;
+                }
+            }
+    
+            prev_human_distances_[track.id] = {current_distance, current_time};
+    
+            if (closing_rate > human_direction_threshold_) {
+                target_sign = 1.0f;  // visual CCW / pass right
+            }
+        }
+        std::set<int> active_ids;
+        for (const auto& track : active_tracks) {
+            active_ids.insert(track.id);
+        }
+        
+        for (auto it = prev_human_distances_.begin(); it != prev_human_distances_.end(); ) {
+            if (active_ids.find(it->first) == active_ids.end()) {
+                it = prev_human_distances_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        
+        current_tangent_direction_ = target_sign;
+        return target_sign;
+    }
+
+    void expand_human_obstacles_for_guidance(float* bound_guidance,
+                                             float* guidance_x,
+                                             float* guidance_y,
+                                             const float* bound_original,
+                                             int num_layers,
+                                             int layer_thickness,
+                                             float bias_strength,
+                                             float sign) {
+        std::memcpy(bound_guidance, bound_original, IMAX * JMAX * sizeof(float));
+    
+        std::vector<bool> current_occupied(IMAX * JMAX, false);
+        std::vector<bool> is_human_region(IMAX * JMAX, false);
+    
+        // Seed from human boundary info
+        for (const auto& info : human_boundary_info_) {
+            const int i = std::get<0>(info);
+            const int j = std::get<1>(info);
+    
+            current_occupied[i * JMAX + j] = true;
+            is_human_region[i * JMAX + j] = true;
+    
+            for (int di = -1; di <= 1; ++di) {
+                for (int dj = -1; dj <= 1; ++dj) {
+                    const int ni = i + di;
+                    const int nj = j + dj;
+                    if (ni >= 0 && ni < IMAX && nj >= 0 && nj < JMAX) {
+                        if (bound_original[ni * JMAX + nj] < 0.0f) {
+                            current_occupied[ni * JMAX + nj] = true;
+                            is_human_region[ni * JMAX + nj] = true;
+                        }
+                    }
+                }
+            }
+        }
+    
+        for (int layer = 1; layer <= num_layers; ++layer) {
+            std::vector<bool> next_occupied = current_occupied;
+            std::vector<std::tuple<int, int, float, float>> new_layer_cells;
+    
+            const int r = layer_thickness;
+    
+            for (int i = r; i < IMAX - r; ++i) {
+                for (int j = r; j < JMAX - r; ++j) {
+                    if (current_occupied[i * JMAX + j]) continue;
+    
+                    bool in_human_range = false;
+                    float avg_gx = 0.0f;
+                    float avg_gy = 0.0f;
+                    int count = 0;
+    
+                    for (int di = -r; di <= r && !in_human_range; ++di) {
+                        for (int dj = -r; dj <= r && !in_human_range; ++dj) {
+                            if (di * di + dj * dj <= r * r) {
+                                const int ni = i + di;
+                                const int nj = j + dj;
+    
+                                if (is_human_region[ni * JMAX + nj] && current_occupied[ni * JMAX + nj]) {
+                                    in_human_range = true;
+    
+                                    for (const auto& info : human_boundary_info_) {
+                                        const int bi = std::get<0>(info);
+                                        const int bj = std::get<1>(info);
+                                        const int dist_sq = (bi - i) * (bi - i) + (bj - j) * (bj - j);
+    
+                                        if (dist_sq <= (layer * r + r) * (layer * r + r)) {
+                                            avg_gx += std::get<2>(info);
+                                            avg_gy += std::get<3>(info);
+                                            ++count;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+    
+                    if (in_human_range && bound_original[i * JMAX + j] > 0.0f) {
+                        if (count > 0) {
+                            avg_gx /= static_cast<float>(count);
+                            avg_gy /= static_cast<float>(count);
+                        } else {
+                            avg_gx = guidance_x[i * JMAX + j];
+                            avg_gy = guidance_y[i * JMAX + j];
+                        }
+    
+                        const float mag = std::sqrt(avg_gx * avg_gx + avg_gy * avg_gy);
+                        if (mag > 0.01f) {
+                            avg_gx /= mag;
+                            avg_gy /= mag;
+                            new_layer_cells.emplace_back(i, j, avg_gx, avg_gy);
+                        }
+    
+                        next_occupied[i * JMAX + j] = true;
+                        is_human_region[i * JMAX + j] = true;
+                    }
+                }
+            }
+    
+            const float ramp = static_cast<float>(layer) / static_cast<float>(num_layers);
+    
+            for (const auto& cell : new_layer_cells) {
+                const int i = std::get<0>(cell);
+                const int j = std::get<1>(cell);
+                const float gx = std::get<2>(cell);
+                const float gy = std::get<3>(cell);
+    
+                const float biased_gx = gx + sign * bias_strength * ramp * gy;
+                const float biased_gy = gy + sign * bias_strength * ramp * (-gx);
+    
+                const float V = std::sqrt(biased_gx * biased_gx + biased_gy * biased_gy);
+                if (V > 0.0f) {
+                    guidance_x[i * JMAX + j] = biased_gx / V * dh0_human;
+                    guidance_y[i * JMAX + j] = biased_gy / V * dh0_human;
+                }
+    
+                bound_guidance[i * JMAX + j] = 0.0f;
+                tangent_layer_display[i * JMAX + j] = static_cast<int8_t>(layer);
+            }
+    
+            current_occupied = next_occupied;
+        }
+    }
+
+    void compute_optimal_forcing_function(float* force,
+                                          const float* guidance_x,
+                                          const float* guidance_y,
+                                          const float* bound) {
+        const float max_div = 10.0f;
+    
+        for (int i = 1; i < IMAX - 1; ++i) {
+            for (int j = 1; j < JMAX - 1; ++j) {
+                force[i * JMAX + j] =
+                    (guidance_x[(i + 1) * JMAX + j] - guidance_x[(i - 1) * JMAX + j]) / (2.0f * DS) +
+                    (guidance_y[i * JMAX + (j + 1)] - guidance_y[i * JMAX + (j - 1)]) / (2.0f * DS);
+    
+                if (bound[i * JMAX + j] > 0.0f) {
+                    // free space: no clamp
+                } else if (bound[i * JMAX + j] < 0.0f) {
+                    force[i * JMAX + j] = std::max(force[i * JMAX + j], max_div);
+                    force[i * JMAX + j] = std::min(force[i * JMAX + j], 0.0f);
+                } else {
+                    force[i * JMAX + j] = 0.0f;
+                }
+            }
+        }
+    }
+
+    ConnectedComponentsData compute_connected_components(const float* occ_true) {
+        ConnectedComponentsData cc;
+        cc.binary = cv::Mat(IMAX, JMAX, CV_8UC1);
+    
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            cc.binary.data[n] = (occ_true[n] < 0.0f) ? 255 : 0;
+        }
+    
+        cc.num_labels = cv::connectedComponentsWithStats(
+            cc.binary,
+            cc.labels,
+            cc.stats,
+            cc.centroids
+        );
+    
+        return cc;
+    }
+
+    std::vector<ClusterInfo> extract_lidar_clusters(const ConnectedComponentsData& cc) {
+        std::vector<ClusterInfo> clusters;
+
+        for (int l = 1; l < cc.num_labels; ++l) {
+            const int area = cc.stats.at<int>(l, cv::CC_STAT_AREA);
+            if (area < 3) continue;
+    
+            ClusterInfo c;
+    
+            const float j_centroid = static_cast<float>(cc.centroids.at<double>(l, 0));
+            const float i_centroid = static_cast<float>(cc.centroids.at<double>(l, 1));
+    
+            c.centroid_x = (j_centroid - JMAX / 2) * DS;
+            c.centroid_y = (i_centroid - IMAX / 2) * DS;
+            c.cell_count = area;
+            c.label_id = l;
+    
+            int yolo_cell_count = 0;
+            int visible_cell_count = 0;
+            int cluster_cell_count = 0;
+    
+            for (int i = 0; i < IMAX; ++i) {
+                for (int j = 0; j < JMAX; ++j) {
+                    if (cc.labels.at<int>(i, j) == l) {
+                        ++cluster_cell_count;
+                        const int idx = i * JMAX + j;
+                        if (class_map[idx] == 1) ++yolo_cell_count;
+                        if (visibility_map[idx] == 1) ++visible_cell_count;
+                    }
+                }
+            }
+    
+            c.has_yolo_seed = (yolo_cell_count >= min_yolo_cells_);
+            c.in_camera_fov = (cluster_cell_count > 0 && visible_cell_count * 2 >= cluster_cell_count);
+    
+            clusters.push_back(c);
+        }
+    
+        return clusters;
+    }
+
+    void label_human_clusters(const float* occ_true) {
+        std::memset(class_map_expanded, 0, IMAX * JMAX * sizeof(int8_t));
+    
+        ConnectedComponentsData cc = compute_connected_components(occ_true);
+        auto clusters = extract_lidar_clusters(cc);
+    
+        const float current_time =
+            std::chrono::duration<float>(std::chrono::steady_clock::now() - t_start).count();
+    
+        human_tracker_->update(clusters, current_time);
+        auto active_tracks = human_tracker_->get_active_tracks();
+    
+        for (const auto& track : active_tracks) {
+            const float track_j = track.x / DS + JMAX / 2.0f;
+            const float track_i = track.y / DS + IMAX / 2.0f;
+    
+            float best_dist = 999999.0f;
+            int best_label = -1;
+    
+            for (int l = 1; l < cc.num_labels; ++l) {
+                const float j_cent = static_cast<float>(cc.centroids.at<double>(l, 0));
+                const float i_cent = static_cast<float>(cc.centroids.at<double>(l, 1));
+                const float dist = std::sqrt((j_cent - track_j) * (j_cent - track_j) +
+                                             (i_cent - track_i) * (i_cent - track_i));
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_label = l;
+                }
+            }
+    
+            const float gate_cells = 1.0f / DS;
+            const int max_human_cells = static_cast<int>(0.4f / (DS * DS));
+    
+            if (best_label > 0 &&
+                best_dist < gate_cells &&
+                track.yolo_ever_confirmed &&
+                track.confidence > 0.5f) {
+    
+                const int cluster_size = cc.stats.at<int>(best_label, cv::CC_STAT_AREA);
+    
+                if (cluster_size <= max_human_cells) {
+                    for (int i = 0; i < IMAX; ++i) {
+                        for (int j = 0; j < JMAX; ++j) {
+                            if (cc.labels.at<int>(i, j) == best_label) {
+                                class_map_expanded[i * JMAX + j] = 1;
+                            }
+                        }
+                    }
+                } else {
+                    const float label_radius = 0.1f / DS;
+                    const float radius_sq = label_radius * label_radius;
+    
+                    for (int i = 0; i < IMAX; ++i) {
+                        for (int j = 0; j < JMAX; ++j) {
+                            if (cc.labels.at<int>(i, j) == best_label) {
+                                const float di = static_cast<float>(i) - track_i;
+                                const float dj = static_cast<float>(j) - track_j;
+                                if (di * di + dj * dj <= radius_sq) {
+                                    class_map_expanded[i * JMAX + j] = 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    
+        int labeled_cells = 0;
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            if (class_map_expanded[n] == 1) ++labeled_cells;
+        }
+        
+        if (enable_human_tracker_dilation_ && labeled_cells > 0) {
+            std::memcpy(class_map_temp_expanded_, class_map_expanded, IMAX * JMAX * sizeof(int8_t));
+        
+            const float* kernel = robot_kernel_human;
+            const int lim = (robot_kernel_dim_human - 1) / 2;
+        
+            for (int i = 1; i < IMAX - 1; ++i) {
+                const int ilow = std::max(i - lim, 0);
+                const int itop = std::min(i + lim, IMAX);
+        
+                for (int j = 1; j < JMAX - 1; ++j) {
+                    if (class_map_expanded[i * JMAX + j] != 1) continue;
+        
+                    const int jlow = std::max(j - lim, 0);
+                    const int jtop = std::min(j + lim, JMAX);
+        
+                    for (int p = ilow; p < itop; ++p) {
+                        for (int q = jlow; q < jtop; ++q) {
+                            const float kernel_val =
+                                kernel[(p - i + lim) * robot_kernel_dim_human + (q - j + lim)];
+                            if (kernel_val < 0.0f) {
+                                class_map_temp_expanded_[p * JMAX + q] = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        
+            std::memcpy(class_map_expanded, class_map_temp_expanded_, IMAX * JMAX * sizeof(int8_t));
+        }
+
+        // Add persistence AFTER normal labeling and dilation.
+        update_persistent_human_memory_from_expanded_map();
+        inject_persistent_humans_into_expanded_map();
+
+        // RCLCPP_INFO_THROTTLE(
+        //     this->get_logger(),
+        //     *this->get_clock(),
+        //     2000,
+        //     "Human persistence: retained_cells=%zu",
+        //     std::count(
+        //         persistent_human_mask_.begin(),
+        //         persistent_human_mask_.end(),
+        //         static_cast<uint8_t>(1)
+        //     )
+        // );
+    }
+
+
+
+
+
+    void safety_filter(const std::vector<float>& vd) {
+        // In body_link frame, robot is always at origin (0, 0)
+        const float ic = y_to_i(0.0f, xc[1]);
+        const float jc = x_to_j(0.0f, xc[0]);
+        const float qc = yaw_to_q(0.0f, xc[2]);
+    
+        // Conservative local estimate of dh/dt around the robot footprint
+        const int range = static_cast<int>(std::round(0.2f / DS));
+        dhdt = 0.0f;
+        for (int di = -range; di <= range; ++di) {
+            for (int dj = -range; dj <= range; ++dj) {
+                const float dhdt_ij = trilinear_interpolation(dhdt_grid, ic + static_cast<float>(di), jc + static_cast<float>(dj), qc);
+                if (dhdt_ij < dhdt) dhdt = dhdt_ij;
+            }
+        }
+    
+        // Safety function value and forward prediction to compensate field age
+        h = trilinear_interpolation(hgrid_active_, ic, jc, qc);
+        const float h_pred = h + dhdt * grid_age;
+    
+        // Guidance field (control direction) from Laplace solve
+        // guidance_y corresponds to x-direction, guidance_x to y-direction
+        const float vx = trilinear_interpolation(guidance_y_grid, ic, jc, qc);
+        const float vy = trilinear_interpolation(guidance_x_grid, ic, jc, qc);
+        const float v_norm = std::sqrt(vx * vx + vy * vy);
+    
+        // Numerical gradient of h-field in x/y
+        const float h_eps = 1.0f;
+        const float hip = trilinear_interpolation(hgrid_active_, ic + h_eps, jc, qc);
+        const float him = trilinear_interpolation(hgrid_active_, ic - h_eps, jc, qc);
+        const float hjp = trilinear_interpolation(hgrid_active_, ic, jc + h_eps, qc);
+        const float hjm = trilinear_interpolation(hgrid_active_, ic, jc - h_eps, qc);
+    
+        const float Dh_x = (hjp - hjm) / (2.0f * h_eps * DS);
+        const float Dh_y = (hip - him) / (2.0f * h_eps * DS);
+    
+        // Store guidance direction for logging/visualization
+        dhdx = vx;
+        dhdy = vy;
+    
+        // Numerical derivative in yaw
+        const float q_eps = 1.0f;
+        const float qp = q_wrap(qc + q_eps);
+        const float qm = q_wrap(qc - q_eps);
+    
+        float hqp = trilinear_interpolation(hgrid_active_, ic, jc, qp);
+        float hqm = trilinear_interpolation(hgrid_active_, ic, jc, qm);
+        dhdq = (hqp - hqm) / (2.0f * q_eps * DQ);
+    
+        // Forward-predicted guidance-aligned derivatives
+        const float dhdx_pred = vx;
+        const float dhdy_pred = vy;
+    
+        hqp += trilinear_interpolation(dhdt_grid, ic, jc, qp) * grid_age;
+        hqm += trilinear_interpolation(dhdt_grid, ic, jc, qm) * grid_age;
+        const float dhdq_pred = (hqp - hqm) / (2.0f * q_eps * DQ);
+    
+        const float Dh_norm = std::sqrt(Dh_x * Dh_x + Dh_y * Dh_y + dhdq_pred * dhdq_pred);
+    
+        // sigma(h) = epsilon * (1 - exp(-kappa * max(0,h)))
+        const float sigma_h =
+            cbf_sigma_epsilon_ *
+            (1.0f - std::exp(-cbf_sigma_kappa_ * std::max(0.0f, h_pred)));
+    
+        // Dynamic dh/dt scaling from eq. 31, clamped to avoid instability
+        const float dhdt_scale =
+            std::min(v_norm / (Dh_norm + sigma_h + 1.0e-6f), 1.0f);
+    
+        // Input-to-State Safety robustness term
+        const float Pu[3] = {2.0f, 2.0f, 1.0f};
+        const float ISSf1 = issf;
+        const float ISSf2 = issf;
+    
+        const float b =
+            dhdx_pred * dhdx_pred / Pu[0] +
+            dhdy_pred * dhdy_pred / Pu[1] +
+            dhdq_pred * dhdq_pred / Pu[2];
+    
+        float ISSf = std::sqrt(b) / ISSf1 + b / ISSf2;
+        const float sigma = std::clamp(-10.0f * dhdt, 0.0f, 1.0f);
+        ISSf *= sigma;
+    
+        // Activating function
+        float a = wn * h_pred;
+        a += vx * vd[0] + vy * vd[1];
+        a += dhdt_scale * dhdt;
+        a += dhdq_pred * vd[2];
+        a -= ISSf;
+    
+        // Half-Sontag correction
+        const float sigma_sontag = 1.0f;
+        float lambda = 0.0f;
+        if (b > 1.0e-4f) {
+            lambda = (-a + std::sqrt(a * a + sigma_sontag * b * b)) / (2.0f * b);
+        }
+    
+        v = vd;
+        if (realtime_sf_flag) {
+            v[0] += lambda * dhdx_pred / Pu[0];
+            v[1] += lambda * dhdy_pred / Pu[1];
+            v[2] += lambda * dhdq_pred / Pu[2];
+        }
+    }
+
+
+
+
+    // ============================================================
+    // 9. STATE
+    // ============================================================
+
+    TimingSample timing_{};
+    std::chrono::steady_clock::time_point latest_field_timestamp_{};
+
+    std::mutex mpc_mutex;
+    MPC3D mpc3d_controller;
+    mutable std::shared_mutex field_mutex_;
+
+    FieldBuffer active_field_;
+    FieldBuffer pending_field_;
+
+    const float h0 = 0.0f;
+    const float dh0 = 1.0f;
+    float wn = 1.0f;
+    float issf = 50.0f;
+
+    bool h_flag = false;
+    bool dhdt_flag = false;
+    bool save_flag = false;
+    bool start_flag = false;
+    bool enable_display = true;
+    bool sit_flag = false;
+    bool stop_flag = false;
+    bool predictive_sf_flag = false;
+    bool realtime_sf_flag = false;
+    int space_counter = 0;
+    int poisson_save_counter = 0;
+
+    const std::vector<char> sorted_parameter_deck = {'1', '2', '3', '4', '5', '6', '0', '0'};
+    std::random_device rd;
+    std::mt19937 gen;
+    std::vector<char> current_parameter_deck;
+
+    std::vector<float> x = {0.0f, 0.0f, 0.0f};
+    std::vector<float> xd = {0.0f, 0.0f, 0.0f};
+    std::vector<float> xc = {-2.0f, -2.0f, 0.0f};
+    std::vector<float> dx = {0.0f, 0.0f, 0.0f};
+
+    std::chrono::steady_clock::time_point t_grid, t_state, t_start;
+    float grid_age = 0.0f;
+    float dt_grid = 1.0e10f;
+    float dt_state = 1.0e10f;
+    float t_ms = 0.0f;
+
+    std::vector<float> vt = {0.0f, 0.0f, 0.0f};
+    std::vector<float> vn = {0.0f, 0.0f, 0.0f};
+    std::vector<float> vd = {0.0f, 0.0f, 0.0f};
+    std::vector<float> v = {0.0f, 0.0f, 0.0f};
+    std::vector<float> vb = {0.0f, 0.0f, 0.0f};
+    std::vector<float> v_meas_body{0.0f, 0.0f, 0.0f};
+    float h{}, dhdt{}, dhdx{}, dhdy{}, dhdq{};
+
+    float occ1[IMAX * JMAX];
+    float occ0[IMAX * JMAX];
+    int8_t conf[IMAX * JMAX];
+    float grid_temp[IMAX * JMAX];
+    float* hgrid1{};
+    float* hgrid0{};
+    float* bound{};
+    float* force{};
+    float* dhdt_grid{};
+    float* robot_kernel_human{};
+    float* robot_kernel_obstacle{};
+    float* guidance_x_grid{};
+    float* guidance_y_grid{};
+
+    // Persistent temp buffers for profiling-ready execution
+    float* hgrid_temp_{};
+    float* guidance_x_temp_{};
+    float* guidance_y_temp_{};
+    float* forcing_zero_temp_{};
+    float* bound_guidance_temp_{};
+    int8_t* class_map_temp_expanded_{};
+    float* boundary_temp_{};
+    float* inflate_bound_temp_{};
+    int8_t* inflate_class_temp_{};
+
+    bool new_constraint_event_flag_{false};
+    int constraint_event_counter_{0};
+    float guidance_x_display[IMAX * JMAX];
+    float guidance_y_display[IMAX * JMAX];
+    float bound_display[IMAX * JMAX];
+    int8_t tangent_layer_display[IMAX * JMAX];
+
+    float robot_length{}, robot_width{};
+    float robot_MOS_human{}, robot_MOS_obstacle{};
+    int robot_kernel_dim_human{}, robot_kernel_dim_obstacle{};
+
+    float* hgrid_insertion_old_{nullptr};
+    float* hgrid_active_{nullptr};
+    float* dhdt_active_{nullptr};
+    float* beta_grid_{nullptr};
+
+    SemanticUpdateState semantic_update_;
+    ConstraintManager constraint_manager_;
+    ConstraintRuntimeConfig constraint_runtime_config_;
+    std::string constraints_path_;
+
+    rclcpp::TimerBase::SharedPtr constraints_reload_timer_;
+    rclcpp::CallbackGroup::SharedPtr constraints_reload_callback_group_;
+    double constraints_reload_hz_{1.0};
+
+    rclcpp::CallbackGroup::SharedPtr mpc_callback_group_;
+    rclcpp::TimerBase::SharedPtr mpc_timer_;
+    rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr key_suber_;
+    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr twist_suber_;
+    rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr occ_grid_suber_;
+    rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr class_map_suber_;
+    rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr visibility_map_suber_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr semantic_observation_suber_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr pose_suber_;
+
+    std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> image_sub_;
+    std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>> cloud_sub_;
+
+    int8_t class_map[IMAX * JMAX];
+    int8_t visibility_map[IMAX * JMAX];
+    int8_t class_map_expanded[IMAX * JMAX];
+
+    std::vector<int8_t> semantic_occupancy_grid_;
+    std::vector<int8_t> semantic_previous_grid_;
+    std::vector<int8_t> semantic_target_grid_;
+    std::vector<int8_t> semantic_current_grid_;
+    std::vector<float> persistent_human_confidence_;
+    std::vector<uint8_t> persistent_human_mask_;
+    std::array<
+    std::vector<int8_t>,
+        NUM_CANONICAL_SEMANTIC_CLASSES>
+        semantic_class_layers_;
+    std::array<
+        std::vector<float>,
+        NUM_CANONICAL_SEMANTIC_CLASSES>
+        semantic_class_last_seen_;
+    std::vector<std::uint16_t>
+        semantic_model_class_grid_;
+    std::vector<std::uint16_t>
+        semantic_canonical_class_grid_;
+    std::unordered_set<SemanticClass>
+        active_semantic_classes_;
+    std::mutex semantic_observation_mutex_;
+
+    bool enable_oak_semantic_observations_{true};
+    bool enable_legacy_yolo_semantics_{true};
+
+    std::string semantic_observation_topic_{
+        "/semantic_volume/occupied_voxels"};
+    std::string semantic_observation_frame_{
+        "body_link"};
+
+    float semantic_observation_timeout_sec_{1.0f};
+    float semantic_observation_min_z_{-0.50f};
+    float semantic_observation_max_z_{1.50f};
+    
+    float human_persistence_decay_{0.96f};
+    float human_persistence_threshold_{0.25f};
+    float human_persistence_observation_value_{1.0f};
+    bool enable_human_persistence_{true};
+    
+    std::unique_ptr<HumanTracker> human_tracker_;
+    int min_yolo_cells_ = 5;
+    bool enable_human_tracker_dilation_ = true;
+    float dh0_human = 1.0f;
+    float dh0_obstacle = 0.3f;
+    bool enable_social_navigation_ = false;
+    float social_tangent_bias_ = 0.5f;
+    int social_tangent_layers_ = 3;
+    int social_layer_thickness_ = 1;
+    float current_tangent_direction_ = 1.0f;
+    float human_direction_threshold_ = 0.15f;
+    std::map<int, std::pair<float, float>> prev_human_distances_;
+    std::vector<std::tuple<int, int, float, float, float>> human_boundary_info_;
+
+    std::vector<int8_t> relational_debug_grid_;
+    rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr relational_debug_pub_;
+
+    float tight_area_human_threshold_ = 2.0f;
+    float tight_area_h_threshold_ = 0.3f;
+    float tight_area_wall_slack_ = -0.1f;
+
+    float cbf_sigma_epsilon_ = 0.1f;
+    float cbf_sigma_kappa_ = 5.0f;
+    float vel_max_x_fwd_ = 0.9f;
+    float vel_max_x_bwd_ = 0.9f;
+    float vel_max_y_ = 0.9f;
+    float vel_max_yaw_ = 0.8f;
+
+    unitree_api::msg::Request req;
+    SportClient sport_req;
+    std::ofstream outFileCSV;
+    std::ofstream outFileBIN;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr poisson_image_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr logging_data_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr profiling_data_pub_;
+    rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr semantic_occupancy_pub_;
+    double logging_publish_hz_ = 10.0;
+    double logging_publish_period_ = 0.1;
+    std::chrono::steady_clock::time_point last_logging_publish_time_;
+    bool enable_data_logging_to_file_ = true;
+};
+
+} // namespace ss
+
+int main(int argc, char* argv[]) {
+    rclcpp::init(argc, argv);
+
+    rclcpp::executors::MultiThreadedExecutor executor;
+
+    auto poissonNode = std::make_shared<ss::PoissonControllerNode>();
+
+    // Read CloudMerger parameters from the Poisson node so behavior matches the original setup
+    const float min_z = poissonNode->get_parameter("min_z").as_double();
+    const float max_z = poissonNode->get_parameter("max_z").as_double();
+
+    // RCLCPP_INFO(
+    //     poissonNode->get_logger(),
+    //     "Passing min_z=%.2f, max_z=%.2f to CloudMergerNode",
+    //     min_z, max_z
+    // );
+
+    auto mappingNode = std::make_shared<CloudMergerNode>(min_z, max_z);
+
+    executor.add_node(mappingNode);
+    executor.add_node(poissonNode);
+
+    RCLCPP_INFO(
+        poissonNode->get_logger(),
+        "Poisson node added to executor"
+    );
+
+    try {
+        executor.spin();
+        throw("Terminated");
+    } catch (const char* msg) {
+        rclcpp::shutdown();
+        std::cout << msg << std::endl;
+    }
+
+    return 0;
+}
